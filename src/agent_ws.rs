@@ -300,13 +300,21 @@ fn locate(app: Shared, node_id: i64, ip: String) {
     drop(asked);
 
     tokio::spawn(async move {
-        let lookup = async {
-            let url = format!("https://ipinfo.io/{ip}/country");
-            anyhow::Ok(app.http.get(url).send().await?.error_for_status()?.text().await?)
-        };
-        let cc = match lookup.await {
-            Ok(body) => body.trim().to_ascii_uppercase(),
-            Err(e) => return debug!("node {node_id}: no country for {ip}: {e:#}"),
+        // A local provider answers without a request; ipinfo stays online. A
+        // local provider without its database reads as no answer, the same
+        // state an outage of the online one leaves.
+        let cc = match crate::geo::lookup(&app, &ip) {
+            Some(cc) => cc,
+            None => {
+                let lookup = async {
+                    let url = format!("https://ipinfo.io/{ip}/country");
+                    anyhow::Ok(app.http.get(url).send().await?.error_for_status()?.text().await?)
+                };
+                match lookup.await {
+                    Ok(body) => body.trim().to_ascii_uppercase(),
+                    Err(e) => return debug!("node {node_id}: no country for {ip}: {e:#}"),
+                }
+            }
         };
         if cc.len() != 2 || !cc.bytes().all(|b| b.is_ascii_uppercase()) {
             return debug!("node {node_id}: {ip} resolved to no country");

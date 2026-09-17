@@ -98,6 +98,10 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // in, which is what a status page conveys, without locating it. The
         // address it was derived from remains behind the panel.
         "country": node.country,
+        // Semicolon-separated badges and the filter group, both shown on the
+        // public card on purpose.
+        "tag": node.tag,
+        "group": node.node_group,
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
@@ -509,15 +513,17 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
-        "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
+        // The sign-in page asks for an authenticator code only when one is bound.
+        "totp": crate::auth::totp_bound(&app),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
+        "site_description": app.db.get("site_description").unwrap_or_default(),
         "public_page": app.public_page(),
         "can_provision": provisioning_allowed(&app, &headers),
         // The hub's own public URL when one was given, which is what belongs in an
-        // install command and in the OAuth callback -- not whichever address this
-        // browser used, which behind a proxy may be a loopback port. Empty by
-        // default, in which case the browser's address is the only one available
-        // and the panel falls back to its own origin.
+        // install command -- not whichever address this browser used, which
+        // behind a proxy may be a loopback port. Empty by default, in which case
+        // the browser's address is the only one available and the panel falls
+        // back to its own origin.
         "site": app.site,
     }))
 }
@@ -546,10 +552,24 @@ pub async fn create_node(
         // Usable immediately: the install command is readable from the node list,
         // so adding and deploying require no reissue in between.
         Ok(id) => {
+            join_ping_queue(&app, id);
             invalidate_snapshot(&app);
             Json(json!({"id": id})).into_response()
         }
         Err(e) => fail(e),
+    }
+}
+
+/// Adds a freshly created server to every existing probe when the setting asks
+/// for it, and pushes the new assignments out. Failure to join is logged rather
+/// than fatal: the server exists either way and can be assigned by hand.
+fn join_ping_queue(app: &App, id: i64) {
+    if app.db.get("auto_join_ping").as_deref() != Some("on") {
+        return;
+    }
+    match app.db.assign_node_to_all_ping_tasks(id) {
+        Ok(()) => agent_ws::push_ping_tasks(app),
+        Err(e) => tracing::warn!("server {id} was not added to the latency queue: {e:#}"),
     }
 }
 
@@ -633,8 +653,9 @@ pub async fn agent_register(
     };
     let token = random_token();
     match app.db.create_node(&node, &token) {
-        Ok(_) => {
+        Ok(id) => {
             app.registrations.clear(ip);
+            join_ping_queue(&app, id);
             invalidate_snapshot(&app);
             token.into_response()
         }
@@ -849,13 +870,16 @@ pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Pat
 }
 
 /// Settings the panel may read. Secrets are deliberately excluded: the client can
-/// set the GitHub secret but never read it back.
+/// set the GeoIP license key but never read it back.
 const READABLE_SETTINGS: &[&str] = &[
     "site_name",
+    "site_description",
     "public_page",
-    "github_client_id",
-    "github_allowed_users",
-    "retention_days",
+    "auto_join_ping",
+    "geoip_provider",
+    "geoip_account_id",
+    "retention_metrics_days",
+    "retention_ping_days",
     "theme",
     "github_proxy",
 ];
@@ -1125,12 +1149,12 @@ async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
 /// Drops history beyond the retention window and rebuilds the file around what
 /// remains, which is the only way SQLite returns the space to the filesystem.
 pub async fn db_vacuum(_: Admin, State(app): State<Shared>) -> Response {
-    let keep = app.db.retention_days();
+    let keep = (app.db.retention_metrics_days(), app.db.retention_ping_days());
     let app = app.clone();
     // A rebuild of the whole file, holding the connection the agents write
     // through, so it belongs on a blocking thread.
     let done = tokio::task::spawn_blocking(move || {
-        let pruned = app.db.prune(keep)?;
+        let pruned = app.db.prune(keep.0, keep.1)?;
         app.db.vacuum().map(|freed| json!({"pruned": pruned, "freed": freed}))
     })
     .await;
@@ -1384,17 +1408,35 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     for key in READABLE_SETTINGS {
         out.insert((*key).to_owned(), json!(app.db.get(key).unwrap_or_default()));
     }
-    // The one readable key with a default that also rejects the empty string:
-    // `setting_error` below refuses "" and `save_settings` writes nothing when any
-    // key fails, so a hub where this was never set returned "" here and then
-    // rejected the entire settings form, naming a field that was never edited.
-    // `retention_days()` already holds the default `prune` and the data page read,
-    // so it answers here as well.
-    out.insert("retention_days".into(), json!(app.db.retention_days().to_string()));
+    // Keys with defaults that also reject the empty string: `setting_error`
+    // below refuses "" and `save_settings` writes nothing when any key fails,
+    // so a hub where one was never set returned "" here and then rejected the
+    // entire settings form, naming a field that was never edited. The readers
+    // already hold the defaults `prune` and the data page use, so they answer
+    // here as well.
+    out.insert("retention_metrics_days".into(), json!(app.db.retention_metrics_days().to_string()));
+    out.insert("retention_ping_days".into(), json!(app.db.retention_ping_days().to_string()));
+    out.insert("auto_join_ping".into(), json!(if app.db.get("auto_join_ping").as_deref() == Some("on") { "on" } else { "off" }));
     out.insert(
-        "github_secret_set".into(),
-        json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
+        "geoip_provider".into(),
+        json!(crate::geo::provider(&app).to_string()),
     );
+    out.insert(
+        "totp_set".into(),
+        json!(crate::auth::totp_bound(&app)),
+    );
+    out.insert(
+        "emergency_password_set".into(),
+        json!(app.db.get("emergency_password_hash").is_some_and(|v| !v.is_empty())),
+    );
+    out.insert(
+        "geoip_license_key_set".into(),
+        json!(app.db.get("geoip_license_key").is_some_and(|v| !v.is_empty())),
+    );
+    if let Some((updated, size)) = crate::geo::database_state(&app) {
+        out.insert("geoip_updated".into(), json!(updated));
+        out.insert("geoip_size".into(), json!(size));
+    }
     // Read-only here. A window is opened and closed through its own route, so the
     // key is always one the hub generated, and `save_settings` continues to refuse
     // both names.
@@ -1422,8 +1464,22 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "theme" if !crate::frontend::selectable(app, value) => Some("theme is not installed".into()),
         // Housekeeping clamps whatever it reads, so an unparsable value would be
         // stored, echoed back, and silently mean 7 days indefinitely.
-        "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
+        "retention_metrics_days" | "retention_ping_days"
+            if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) =>
+        {
             Some("retention days must be a number from 1 to 3650".into())
+        }
+        "auto_join_ping" if !matches!(value, "on" | "off") => {
+            Some("auto join must be on or off".into())
+        }
+        "geoip_provider" if !matches!(value, "ipinfo" | "maxmind" | "dbip") => {
+            Some("geoip provider must be ipinfo, maxmind or dbip".into())
+        }
+        "geoip_account_id" if !value.is_empty() && !value.bytes().all(|b| b.is_ascii_digit()) => {
+            Some("geoip account id must be digits".into())
+        }
+        "site_description" if value.chars().count() > 200 => {
+            Some("site description must fit in 200 characters".into())
         }
         // The hub fetches this URL itself, so it must be one: a scheme it cannot
         // speak turns every agent download into a 502 that says nothing about the
@@ -1439,8 +1495,14 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
+        // The recovery credential gets the same floor: it bypasses the second
+        // factor, so a weak one would spend that strength twice over.
+        "emergency_password" if !value.is_empty() && value.len() < 12 => {
+            Some("emergency password must be at least 12 characters, or empty to clear".into())
+        }
+        "emergency_password" => None,
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
-        k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
+        k if READABLE_SETTINGS.contains(&k) || k == "geoip_license_key" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
 }
@@ -1475,11 +1537,46 @@ pub async fn save_settings(
             }
             continue;
         }
+        // The recovery credential stands outside the sessions: setting it does
+        // not sign anyone out, and clearing it (empty string) removes the
+        // fallback path entirely.
+        if key == "emergency_password" {
+            if value.is_empty() {
+                if let Err(e) = app.db.set("emergency_password_hash", "") {
+                    return fail(e);
+                }
+            } else {
+                match hash_password(value) {
+                    Ok(h) => {
+                        if let Err(e) = app.db.set("emergency_password_hash", &h) {
+                            return fail(e);
+                        }
+                    }
+                    Err(e) => return fail(e),
+                }
+            }
+            continue;
+        }
         if let Err(e) = app.db.set(key, value) {
             return fail(e);
         }
     }
     with_cookies(Json(json!({"ok": true})), [reissued])
+}
+
+/// Fetches the selected GeoIP provider's local database, on the operator's
+/// click. The download itself is async I/O; nothing holds a database
+/// connection while it runs.
+pub async fn geoip_update(_: Admin, State(app): State<Shared>) -> Response {
+    match crate::geo::download(&app).await {
+        Ok((provider, size)) => Json(json!({
+            "provider": provider,
+            "size": size,
+            "updated": crate::geo::database_state(&app).map(|s| s.0),
+        }))
+        .into_response(),
+        Err(e) => fail(e),
+    }
 }
 
 #[cfg(test)]
@@ -2373,7 +2470,7 @@ mod tests {
         let save = |body: Value| save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(body));
 
         // BTreeMap order places the password first, which is the failing case.
-        let refused = save(json!({"admin_password": "a-long-enough-one", "retention_days": "abc"})).await;
+        let refused = save(json!({"admin_password": "a-long-enough-one", "retention_metrics_days": "abc"})).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(app.db.get("admin_password_hash").as_deref(), Some("the-old-hash"));
 
@@ -2383,9 +2480,9 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(app.db.get("public_page"), None);
 
-        let saved = save(json!({"public_page": "off", "retention_days": "7"})).await;
+        let saved = save(json!({"public_page": "off", "retention_metrics_days": "7"})).await;
         assert_eq!(saved.status(), StatusCode::OK);
-        assert_eq!(app.db.get("retention_days").as_deref(), Some("7"));
+        assert_eq!(app.db.get("retention_metrics_days").as_deref(), Some("7"));
     }
 
     /// The install script and the sign-in page keep separate counters: five
@@ -2544,15 +2641,15 @@ mod tests {
                 Admin,
                 State(app.clone()),
                 HeaderMap::new(),
-                Json(json!({"retention_days": v.to_owned()})),
+                Json(json!({"retention_metrics_days": v.to_owned()})),
             )
         };
         for junk in ["", "abc", "0", "-1", "9999"] {
             assert_eq!(put(junk).await.status(), StatusCode::BAD_REQUEST, "{junk:?}");
         }
-        assert!(app.db.get("retention_days").is_none(), "a refused window must not be stored");
+        assert!(app.db.get("retention_metrics_days").is_none(), "a refused window must not be stored");
         assert_eq!(put("7").await.status(), StatusCode::OK);
-        assert_eq!(app.db.get("retention_days").as_deref(), Some("7"));
+        assert_eq!(app.db.get("retention_metrics_days").as_deref(), Some("7"));
     }
 
     /// What `settings` returns must be what `save_settings` accepts. The panel
@@ -2563,12 +2660,19 @@ mod tests {
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
-        assert_eq!(read["retention_days"], "7", "the default belongs in the answer, not in each caller");
+        assert_eq!(
+            read["retention_metrics_days"],
+            "7",
+            "the default belongs in the answer, not in each caller"
+        );
+        assert_eq!(read["retention_ping_days"], "7");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
             "site_name": read["site_name"],
-            "retention_days": read["retention_days"],
+            "site_description": read["site_description"],
+            "retention_metrics_days": read["retention_metrics_days"],
+            "retention_ping_days": read["retention_ping_days"],
             "github_proxy": read["github_proxy"],
             "public_page": "on",
             "notify_grace": read["notify_grace"],
@@ -2584,24 +2688,27 @@ mod tests {
             StatusCode::OK,
             "a fresh hub's own settings must survive a round trip"
         );
-        assert_eq!(app.db.retention_days(), 7, "and the stored window is the one that was shown");
+        assert_eq!(
+            app.db.retention_metrics_days(),
+            7,
+            "and the stored window is the one that was shown"
+        );
+        assert_eq!(app.db.retention_ping_days(), 7);
     }
 
     #[tokio::test]
     async fn settings_never_hand_back_a_secret() {
         let app = app();
-        app.db.set("github_client_secret", "super-secret").unwrap();
-        app.db.set("github_client_id", "public-id").unwrap();
+        app.db.set("geoip_license_key", "license-secret").unwrap();
+        app.db.set("totp_secret", "gezdgnbvgy3tqojq").unwrap();
         app.db.set("notify_telegram_token", "123:bot-secret").unwrap();
         app.db.set("notify_webhook_url", "https://hooks.example/url-secret").unwrap();
         app.db.set("notify_webhook_headers", "Authorization: header-secret").unwrap();
-
         let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
-        assert_eq!(body["github_client_id"], "public-id");
-        assert_eq!(body["github_secret_set"], true);
-        assert_eq!(body["notify_webhook_url_set"], true);
-        assert!(body.get("github_client_secret").is_none());
-        for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
+        assert_eq!(body["geoip_license_key_set"], true);
+        assert_eq!(body["totp_set"], true);
+        assert!(body.get("geoip_license_key").is_none());
+        for secret in ["license-secret", "gezdgnbvgy3tqojq", "bot-secret", "url-secret", "header-secret"] {
             assert!(!body.to_string().contains(secret), "{secret}");
         }
     }

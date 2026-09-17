@@ -63,6 +63,10 @@ export type Node = {
   token?: string
   /** Panel only. Whether going offline and returning are announced. */
   notify?: boolean
+  /** Semicolon-separated badges, shown on the public card. */
+  tag: string
+  /** Filter dimension for the panel and the public page; empty means none. */
+  group: string
 }
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[] }

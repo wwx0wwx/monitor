@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod geo;
 mod notify;
 
 use std::collections::HashMap;
@@ -392,8 +393,7 @@ async fn main() -> Result<()> {
         // Sign-in.
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
-        .route("/api/auth/github", get(auth::github_start))
-        .route("/api/auth/github/callback", get(auth::github_callback))
+        .route("/api/auth/totp", get(auth::totp_begin).put(auth::totp_confirm).delete(auth::totp_disable))
         // Panel.
         .route("/api/nodes", post(api::create_node))
         .route("/api/register-window", post(api::open_register).delete(api::close_register))
@@ -414,6 +414,7 @@ async fn main() -> Result<()> {
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
+        .route("/api/geoip/update", post(api::geoip_update))
         .fallback(frontend::serve)
         // A report is a few hundred bytes; anything larger is not a report.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
@@ -553,8 +554,8 @@ fn first_run(app: &App, url: &str) -> Result<()> {
     println!(
         "\n  Monitor hub is ready.\n\n  \
          Sign in at {url}/admin\n  \
-         Emergency password: {password}\n\n  \
-         This is shown once. Change it, and set up GitHub sign-in, under Security.\n"
+         Password: {password}\n\n  \
+         This is shown once. Change it, and set up two-factor, under Security.\n"
     );
     Ok(())
 }
@@ -613,8 +614,8 @@ async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
     loop {
         ticker.tick().await;
-        let keep = app.db.retention_days();
-        if let Err(e) = app.db.prune(keep) {
+        let keep = (app.db.retention_metrics_days(), app.db.retention_ping_days());
+        if let Err(e) = app.db.prune(keep.0, keep.1) {
             warn!("pruning history failed: {e:#}");
         }
         if let Err(e) = app.db.expire_sessions() {

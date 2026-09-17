@@ -8,10 +8,10 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, provisioningSite, useNodes } from "@/lib/api"
 
-type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string; can_provision: boolean }
+type Me = { authed: boolean; totp: boolean; site_name: string; public_page: boolean; site: string; can_provision: boolean }
 
 // `/admin` alone is not a page; it is normalised to the first section so that a
-// bookmark and the OAuth redirect both resolve to a real route.
+// bookmark resolves to a real route.
 function normalise(p: string) {
   return p === "/admin" || p === "/admin/" ? "/admin/nodes" : p.replace(/\/$/, "") || "/admin/nodes"
 }
@@ -92,7 +92,7 @@ export default function App() {
   if (!me.authed) {
     return (
       <>
-        <Login github={me.github} onDone={() => { loadMe(); refresh(); go("/admin/nodes") }} />
+        <Login totp={me.totp} onDone={() => { loadMe(); refresh(); go("/admin/nodes") }} />
         <Toaster position="top-center" theme={dark ? "dark" : "light"} />
       </>
     )

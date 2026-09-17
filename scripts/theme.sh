@@ -3,9 +3,14 @@
 # picks it up. The hub embeds a built theme derived from web-theme.pin, placed
 # outside any working tree so nothing can drift from the pin.
 #
-# Called by build.rs, and by CI before cargo runs so that the download happens
+# Called by build.rs, and by CI before cargo runs so that any download happens
 # on the runner rather than inside the cross container, which does not
 # necessarily carry curl.
+#
+# Two sources, in order: vendor/theme/ committed to this repository, then the
+# upstream GitHub release. The vendored copy makes this fork buildable with no
+# network at all -- the whole point of forking -- and its stamp carries the same
+# `<tag> <sha256>` the pin names, so a re-pin takes effect the same way.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -22,6 +27,26 @@ URL="https://github.com/monitor-probe/monitor-theme-default/releases/download/$T
 # stamp is also left alone, which is how an unreleased theme is built against.
 if [ -f "$DEST/.pin" ] && [ "$(cat "$DEST/.pin")" = "$TAG $SHA" ]; then
   exit 0
+fi
+
+install_from() {
+  # The directory is an installable theme, the same layout frontend.rs reads
+  # from disk. Without dist/index.html and theme.json the hub would embed
+  # nothing.
+  if [ ! -f "$1/dist/index.html" ] || [ ! -f "$1/theme.json" ]; then
+    return 1
+  fi
+  rm -rf "$DEST"
+  mkdir -p "$DEST"
+  cp -R "$1/." "$DEST/"
+  printf '%s %s\n' "$TAG" "$SHA" >"$DEST/.pin"
+  echo "default theme $TAG taken from $1"
+}
+
+# The vendored copy first: stamped with the same pin, so it answers only for
+# the exact release web-theme.pin names.
+if [ -f vendor/theme/.pin ] && [ "$(cat vendor/theme/.pin)" = "$TAG $SHA" ]; then
+  install_from vendor/theme && exit 0
 fi
 
 mkdir -p target

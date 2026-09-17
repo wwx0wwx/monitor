@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
+import QRCode from "qrcode"
 import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
@@ -110,14 +111,14 @@ function CreateNode({ onClose, onSaved }: {
 
   async function save(e: React.FormEvent) {
     e.preventDefault()
-    if (!name.trim()) return toast.error("请填写节点名称")
+    if (!name.trim()) return toast.error("请填写服务器名称")
     setSaving(true)
     try {
       await api("/nodes", {
         method: "POST",
         body: JSON.stringify({ name: name.trim() }),
       })
-      toast.success("节点已添加")
+      toast.success("服务器已添加")
       onClose()
       onSaved()
     } catch (e) {
@@ -131,7 +132,7 @@ function CreateNode({ onClose, onSaved }: {
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>添加节点</DialogTitle>
+          <DialogTitle>添加服务器</DialogTitle>
         </DialogHeader>
         <form className="space-y-4" onSubmit={save}>
           <Field label="名称">
@@ -165,15 +166,16 @@ function NodeForm({ node, onClose, onSaved }: {
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
   async function save() {
-    if (!form.name.trim()) return toast.error("请填写节点名称")
+    if (!form.name.trim()) return toast.error("请填写服务器名称")
     const patch = changes(node, {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      tag: form.tag.trim(),
+      group: form.group.trim(),
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
-      notify: !!form.notify,
     })
     const correction = trafficCorrection(pristine.current, traffic)
     if ([patch.traffic_limit, ...Object.values(correction)].some((v) => v !== undefined && (!Number.isSafeInteger(v) || v < 0))) {
@@ -192,7 +194,7 @@ function NodeForm({ node, onClose, onSaved }: {
           body: JSON.stringify(correction),
         })
       }
-      toast.success("节点设置已保存")
+      toast.success("服务器设置已保存")
       onClose()
       onSaved()
     } catch (e) {
@@ -235,6 +237,14 @@ function NodeForm({ node, onClose, onSaved }: {
               <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途" />
             </Field>
           </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="标签" hint="分号分隔，公开页以徽章展示">
+              <Input value={form.tag ?? ""} onChange={(e) => set("tag", e.target.value)} placeholder="dedicated;16v;32g;16T;500MpsUp" />
+            </Field>
+            <Field label="分组" hint="用于列表筛选，留空不分组">
+              <Input value={form.group ?? ""} onChange={(e) => set("group", e.target.value)} placeholder="香港" list="node-groups" />
+            </Field>
+          </div>
           <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
             <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
             <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
@@ -260,13 +270,9 @@ function NodeForm({ node, onClose, onSaved }: {
             </span>
             <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
           </label>
-          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-            <span>
-              <span className="block font-medium">离线通知</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期推送一条，恢复在线时再推一条</span>
-            </span>
-            <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
-          </label>
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            离线通知不再按服务器单独设置，请到「通知」页统一开关。
+          </p>
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>取消</Button>
@@ -486,9 +492,41 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [interval, setInterval] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
+  // The hub relays the agent binary from GitHub behind this prefix. Surfaced
+  // here because the moment it matters is exactly this one: installing onto a
+  // machine while the hub itself cannot reach github.com.
+  const [proxy, setProxy] = useState<string | null>(null)
+  const [proxyOn, setProxyOn] = useState(false)
+  useEffect(() => {
+    api<Settings>("/settings")
+      .then((s) => {
+        const stored = String(s.github_proxy ?? "")
+        setProxy(stored)
+        setProxyOn(stored !== "")
+      })
+      .catch(() => setProxy(""))
+  }, [])
 
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
   const command = token ? installCommand(site, token, seconds) : ""
+
+  // The toggle stores the setting itself: on with an address, or off clearing
+  // it. The install command never changes -- the hub relays either way.
+  async function toggleProxy(on: boolean, address = proxy ?? "") {
+    if (on && !address.trim()) {
+      toast.error("请先填写代理地址，例如 https://ghfast.top")
+      return
+    }
+    const next = on ? address.trim() : ""
+    try {
+      await api("/settings", { method: "PUT", body: JSON.stringify({ github_proxy: next }) })
+      setProxy(next)
+      setProxyOn(on)
+      toast.success(on ? "已启用 GitHub 代理" : "已改为直连 GitHub")
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
+  }
 
   async function rotate() {
     setRotating(true)
@@ -515,6 +553,26 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
             <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
           </Field>
+          <div className="space-y-2 rounded-lg border bg-muted/30 px-3 py-2.5">
+            <label className="flex cursor-pointer items-center justify-between gap-4 text-sm">
+              <span>
+                <span className="block font-medium">GitHub 代理</span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  agent 二进制由 hub 从 GitHub 中转下载；hub 直连不上 GitHub 时启用
+                </span>
+              </span>
+              <Switch checked={proxyOn} onCheckedChange={(v) => toggleProxy(v)} />
+            </label>
+            <div className="flex gap-2">
+              <Input
+                className="text-xs"
+                value={proxy ?? ""}
+                onChange={(e) => setProxy(e.target.value)}
+                placeholder="https://ghfast.top"
+              />
+              <Button size="sm" variant="outline" disabled={!proxyOn} onClick={() => toggleProxy(true)}>保存</Button>
+            </div>
+          </div>
           <div className="space-y-2">
             <Label className="text-sm font-medium">安装命令</Label>
             <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
@@ -567,6 +625,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   const [removing, setRemoving] = useState(false)
   const [manualOrder, setManualOrder] = useState<number[]>([])
   const [query, setQuery] = useState("")
+  const [group, setGroup] = useState("")
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
   const byId = new Map(nodes.map((node) => [node.id, node]))
@@ -575,12 +634,14 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
     ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
     ...nodes.filter((node) => !orderedIds.has(node.id)),
   ]
+  // Groups exist only as they are used; the filter offers what the fleet has.
+  const groups = [...new Set(nodes.map((n) => n.group).filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"))
   // Name and address, the two things a row is looked up by. `order` itself stays
   // whole, because the order sent on drop is the order of every node.
   const needle = query.trim().toLowerCase()
-  const visible = needle
-    ? order.filter((n) => [n.name, n.ip, n.ipv4, n.ipv6].some((v) => v?.toLowerCase().includes(needle)))
-    : order
+  const visible = order
+    .filter((n) => !group || n.group === group)
+    .filter((n) => !needle || [n.name, n.ip, n.ipv4, n.ipv6].some((v) => v?.toLowerCase().includes(needle)))
 
   async function remove() {
     if (!deleting) return
@@ -627,12 +688,36 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
 
   return (
     <div className="space-y-4">
-      {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
+      {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装服务器。</p>}
+      <datalist id="node-groups">
+        {groups.map((g) => <option key={g} value={g} />)}
+      </datalist>
+      {/* A group filter, offered only when groups exist: a fleet of one group
+          needs no chips. */}
+      {groups.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            onClick={() => setGroup("")}
+            className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${group === "" ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`}
+          >
+            全部 {nodes.length}
+          </button>
+          {groups.map((g) => (
+            <button
+              key={g}
+              onClick={() => setGroup(g === group ? "" : g)}
+              className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${g === group ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`}
+            >
+              {g} {nodes.filter((n) => n.group === g).length}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <Input
           className="mr-auto w-full sm:w-64"
           placeholder="搜索名称或地址"
-          aria-label="搜索节点"
+          aria-label="搜索服务器"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
@@ -642,7 +727,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
           <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
         </Button>
         <Button disabled={!canProvision} onClick={() => setCreating(true)}>
-          <Plus /> 添加节点
+          <Plus /> 添加服务器
         </Button>
       </div>
 
@@ -744,13 +829,13 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
+                  <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑服务器" aria-label="编辑服务器">
                     <Pencil />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setBilling(n)} title="续费设置" aria-label="续费设置">
                     <CalendarClock />
                   </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除节点" aria-label="删除节点">
+                  <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除服务器" aria-label="删除服务器">
                     <Trash2 className="text-destructive" />
                   </Button>
                 </TableCell>
@@ -759,14 +844,14 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
             {nodes.length === 0 && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有节点，右上角添加
+                  还没有服务器，右上角添加
                 </TableCell>
               </TableRow>
             )}
             {needle && nodes.length > 0 && !visible.length && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  没有匹配的节点
+                  没有匹配的服务器
                 </TableCell>
               </TableRow>
             )}
@@ -802,9 +887,9 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
       )}
       {deleting && (
         <ConfirmDialog
-          title={`删除节点「${deleting.name}」？`}
+          title={`删除服务器「${deleting.name}」？`}
           description="历史指标、流量记录和凭证一并删除，不可恢复。"
-          confirmLabel="删除节点"
+          confirmLabel="删除服务器"
           busy={removing}
           onClose={() => setDeleting(null)}
           onConfirm={remove}
@@ -820,6 +905,9 @@ function Ping({ nodes }: { nodes: Node[] }) {
   const [deleting, setDeleting] = useState<PingTask | null>(null)
   const [saving, setSaving] = useState(false)
   const [removing, setRemoving] = useState(false)
+  // The server picker starts closed: on a fleet of a hundred the flat checkbox
+  // list made this dialog taller than the screen.
+  const [pickerOpen, setPickerOpen] = useState(false)
 
   const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
   useEffect(() => { load() }, [])
@@ -877,7 +965,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
               <TableHead className="w-[24%]">名称</TableHead>
               <TableHead className="w-[40%]">目标</TableHead>
               <TableHead className="w-[12%]">间隔</TableHead>
-              <TableHead className="w-[12%]">节点</TableHead>
+              <TableHead className="w-[12%]">服务器</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -887,7 +975,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 <TableCell className="font-medium">{t.name}</TableCell>
                 <TableCell className="tnum text-sm">{t.target}</TableCell>
                 <TableCell className="tnum text-sm">{t.interval}s</TableCell>
-                <TableCell className="text-sm text-muted-foreground">{t.nodes.length} 个</TableCell>
+                <TableCell className="text-sm text-muted-foreground">{t.nodes.length} 台</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" onClick={() => setEditing(t)} title="编辑监控" aria-label="编辑监控"><Pencil /></Button>
                   <Button variant="ghost" size="icon" onClick={() => setDeleting(t)} title="删除监控" aria-label="删除监控">
@@ -899,7 +987,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
             {tasks.length === 0 && (
               <TableRow>
                 <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有延迟监控。每个节点独立 TCP 连接目标端口并上报耗时。
+                  还没有延迟监控。每台服务器独立 TCP 连接目标端口并上报耗时。
                 </TableCell>
               </TableRow>
             )}
@@ -933,16 +1021,28 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 <Input value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
               </Field>
               <div className="space-y-2">
-                <Label className="text-sm font-medium">运行节点</Label>
-                <div className="max-h-48 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
-                  {nodes.map((n) => (
-                    <label key={n.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-background">
-                      <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="accent-primary" />
-                      {n.name}
-                    </label>
-                  ))}
-                  {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
+                <div className="flex items-center justify-between gap-3">
+                  <Label className="text-sm font-medium">
+                    运行服务器
+                    {editing.nodes?.length ? (
+                      <span className="ml-1 text-xs text-muted-foreground">已选 {editing.nodes.length} / {nodes.length}</span>
+                    ) : null}
+                  </Label>
+                  <Button type="button" size="sm" variant="ghost" onClick={() => setPickerOpen((v) => !v)}>
+                    {pickerOpen ? "收起" : "展开"}
+                  </Button>
                 </div>
+                {pickerOpen && (
+                  <div className="max-h-64 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
+                    {nodes.map((n) => (
+                      <label key={n.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-background">
+                        <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="accent-primary" />
+                        {n.name}
+                      </label>
+                    ))}
+                    {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加服务器</p>}
+                  </div>
+                )}
               </div>
             </div>
             <DialogFooter>
@@ -1217,9 +1317,33 @@ function useSettings() {
   }
 }
 
+const GEOIP_PROVIDERS: Record<string, string> = {
+  ipinfo: "ipinfo.io（在线，无需数据库）",
+  dbip: "db-ip LITE（本地库，无需注册）",
+  maxmind: "MaxMind GeoLite2（本地库，需账号）",
+}
+
 function SettingsTab() {
   const { s, set, save } = useSettings()
+  const [updating, setUpdating] = useState(false)
   if (!s) return null
+  const provider = String(s.geoip_provider ?? "ipinfo")
+
+  async function updateGeoip() {
+    setUpdating(true)
+    try {
+      const r = await api<{ provider: string; size: number }>("/geoip/update", { method: "POST" })
+      toast.success(`${GEOIP_PROVIDERS[r.provider] ?? r.provider} 数据库已更新（${bytes(r.size)}）`)
+      // The update time beside the button is part of what /settings reports.
+      const fresh = await api<Settings>("/settings")
+      set("geoip_updated", String(fresh.geoip_updated ?? ""))
+      set("geoip_size", String(fresh.geoip_size ?? ""))
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setUpdating(false)
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -1228,18 +1352,7 @@ function SettingsTab() {
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
           </Field>
-          <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
-            <Input
-              type="number"
-              value={String(s.retention_days ?? "")}
-              onChange={(e) => set("retention_days", e.target.value)}
-              placeholder="7"
-            />
-          </Field>
-          <Field
-            label="GitHub 代理"
-            hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
-          >
+          <Field label="GitHub 代理" hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台服务器上，只填信得过的镜像">
             <Input
               value={String(s.github_proxy ?? "")}
               onChange={(e) => set("github_proxy", e.target.value)}
@@ -1247,6 +1360,13 @@ function SettingsTab() {
             />
           </Field>
         </div>
+        <Field label="站点描述" hint="公开页标题下方展示，并写入页面 meta description">
+          <Input
+            value={String(s.site_description ?? "")}
+            onChange={(e) => set("site_description", e.target.value)}
+            placeholder="一句话介绍这个状态页"
+          />
+        </Field>
         {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
             aria-labelledby 保住读屏软件那边的关联。 */}
         <div className="flex items-center gap-2 text-sm">
@@ -1257,22 +1377,90 @@ function SettingsTab() {
           />
           <span id="public-page-label">开放公开状态页，关闭后所有页面需登录</span>
         </div>
+        <div className="flex items-center gap-2 text-sm">
+          <Switch
+            aria-labelledby="auto-ping-label"
+            checked={s.auto_join_ping === "on"}
+            onCheckedChange={(v) => set("auto_join_ping", v ? "on" : "off")}
+          />
+          <span id="auto-ping-label">新添加的服务器自动加入全部延迟检测任务</span>
+        </div>
         <div>
           <Button
             size="sm"
             onClick={() =>
               save({
                 site_name: String(s.site_name ?? ""),
-                // `||` rather than `??`: the hub returns "" for an unset key
-                // rather than null, and "" is the one value this key's write path
-                // refuses.
-                retention_days: String(s.retention_days || "7"),
+                site_description: String(s.site_description ?? ""),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
+                auto_join_ping: s.auto_join_ping === "on" ? "on" : "off",
               })
             }
           >
             保存站点设置
+          </Button>
+        </div>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">地理位置识别</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            从服务器连接地址识别国家/地区，显示在状态页名称旁。本地库在 hub 上查询，不外发请求。
+          </p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="数据来源">
+            <Select value={provider} onValueChange={(v) => set("geoip_provider", v)}>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {Object.entries(GEOIP_PROVIDERS).map(([k, v]) => (
+                  <SelectItem key={k} value={k}>{v}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+          {provider === "maxmind" && (
+            <Field label="账户 ID" hint="MaxMind 免费账号的 Account ID">
+              <Input value={String(s.geoip_account_id ?? "")} onChange={(e) => set("geoip_account_id", e.target.value)} inputMode="numeric" />
+            </Field>
+          )}
+        </div>
+        {provider === "maxmind" && (
+          <Field label="License Key" hint={s.geoip_license_key_set ? "已设置，留空不变" : "MaxMind 账号里 Manage License Keys 生成"}>
+            <Input type="password" placeholder={s.geoip_license_key_set ? "••••••••" : ""} onChange={(e) => set("geoip_license_key", e.target.value)} />
+          </Field>
+        )}
+        {provider !== "ipinfo" && (
+          <div className="flex flex-wrap items-center gap-3">
+            <Button size="sm" variant="secondary" disabled={updating} onClick={updateGeoip}>
+              <RefreshCw className={updating ? "animate-spin" : ""} /> {updating ? "更新中…" : "更新数据库"}
+            </Button>
+            {s.geoip_updated ? (
+              <span className="text-xs text-muted-foreground">
+                当前数据库 {bytes(Number(s.geoip_size))}，更新于 {new Date(Number(s.geoip_updated) * 1000).toLocaleString()}
+              </span>
+            ) : (
+              <span className="text-xs text-muted-foreground">还没有本地数据库，点更新下载</span>
+            )}
+          </div>
+        )}
+        <div>
+          <Button
+            size="sm"
+            onClick={() => {
+              const patch: Record<string, string> = {
+                geoip_provider: provider,
+                ...(provider === "maxmind" ? { geoip_account_id: String(s.geoip_account_id ?? "") } : {}),
+              }
+              if (provider === "maxmind" && typeof s.geoip_license_key === "string" && s.geoip_license_key) {
+                patch.geoip_license_key = s.geoip_license_key
+              }
+              save(patch)
+            }}
+          >
+            保存识别设置
           </Button>
         </div>
       </Card>
@@ -1339,15 +1527,18 @@ function ChannelCard({ title, configured, children }: { title: string; configure
   )
 }
 
-// Offline alerts are opt-in per node, so turning them on for a fleet needs one
-// place rather than one dialog per node.
+// Offline alerts are opt-in per server, so turning them on for a fleet needs one
+// place rather than one dialog per server.
 function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
   const [busy, setBusy] = useState(false)
+  // Collapsed until asked for: at fleet scale the flat switch grid was the
+  // tallest thing on the notification page.
+  const [open, setOpen] = useState(false)
 
   async function apply(targets: Node[], on: boolean) {
     setBusy(true)
     try {
-      // Awaited in turn, the requests would cost one round trip per node, and
+      // Awaited in turn, the requests would cost one round trip per server, and
       // the two-second stream would render each one as it lands.
       await Promise.all(
         targets
@@ -1368,14 +1559,17 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
           <h3 className="text-sm font-medium">离线通知</h3>
-          <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled} / {nodes.length} 台</p>
+          <p className="mt-1 text-xs text-muted-foreground">按服务器打开，默认关。已打开 {enabled} / {nodes.length} 台</p>
         </div>
         <div className="flex gap-2">
+          <Button size="sm" variant="ghost" onClick={() => setOpen((v) => !v)}>
+            {open ? "收起列表" : "展开列表"}
+          </Button>
           <Button size="sm" variant="secondary" disabled={busy || enabled === nodes.length} onClick={() => apply(nodes, true)}>全部打开</Button>
           <Button size="sm" variant="ghost" disabled={busy || enabled === 0} onClick={() => apply(nodes, false)}>全部关闭</Button>
         </div>
       </div>
-      {nodes.length > 0 && (
+      {open && nodes.length > 0 && (
         <div className="grid max-h-64 gap-x-6 gap-y-2 overflow-y-auto sm:grid-cols-2">
           {nodes.map((node) => (
             <label key={node.id} className="flex cursor-pointer items-center justify-between gap-3 text-sm">
@@ -1419,7 +1613,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <div className="min-w-0 flex-1">
             <h3 className="text-sm font-medium">通知渠道</h3>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按节点打开；流量和到期提醒对填了额度、到期日的节点生效。
+              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。服务器掉线通知在下方按服务器打开；流量和到期提醒对填了额度、到期日的服务器生效。
             </p>
           </div>
           <Button size="sm" variant="secondary" disabled={testing} onClick={test}>
@@ -1522,7 +1716,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
             <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
           </Field>
-          <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的节点，自动续期时也提醒，0 关闭">
+          <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的服务器，自动续期时也提醒，0 关闭">
             <Input type="number" min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
           </Field>
         </div>
@@ -1604,11 +1798,66 @@ function Sessions() {
   )
 }
 
-function Security({ site }: { site: string }) {
+function Security() {
   const { s, set, save } = useSettings()
   const [password, setPassword] = useState("")
+  const [recovery, setRecovery] = useState("")
+  // The TOTP binding flow: begin returns a secret and an otpauth URL, which
+  // becomes a QR to scan; confirm proves the authenticator holds the same
+  // secret with one live code. Neither step is stored until confirm succeeds.
+  const [binding, setBinding] = useState<{ secret: string; url: string; qr: string } | null>(null)
+  const [code, setCode] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [confirmOff, setConfirmOff] = useState(false)
   if (!s) return null
-  const callback = `${site}/api/auth/github/callback`
+
+  async function beginTotp() {
+    setBusy(true)
+    try {
+      const r = await api<{ secret: string; url: string }>("/auth/totp")
+      const qr = await QRCode.toDataURL(r.url, { margin: 1, width: 192 })
+      setBinding({ ...r, qr })
+      setCode("")
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function confirmTotp() {
+    if (!binding) return
+    setBusy(true)
+    try {
+      await api("/auth/totp", { method: "PUT", body: JSON.stringify({ secret: binding.secret, code }) })
+      toast.success("两步验证已开启")
+      setBinding(null)
+      // The flag drives the sign-in page's code field; re-read rather than
+      // guess, same as every credential flag here.
+      const fresh = await api<Settings>("/settings")
+      set("totp_set", String(fresh.totp_set))
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function disableTotp() {
+    setBusy(true)
+    try {
+      await api("/auth/totp", { method: "DELETE" })
+      toast.success("两步验证已关闭")
+      set("totp_set", "false")
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy(false)
+      setConfirmOff(false)
+    }
+  }
+
+  const totpOn = s.totp_set === true
 
   return (
     <div className="space-y-4">
@@ -1616,51 +1865,70 @@ function Security({ site }: { site: string }) {
 
       <Card className="gap-4 p-5">
         <div>
-          <h3 className="text-sm font-medium">GitHub 单点登录</h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            OAuth App 回调地址 <code className="rounded bg-muted px-1">{callback}</code>
+          <h3 className="text-sm font-medium">两步验证（TOTP）</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            开启后登录需要密码加谷歌验证器等 App 的 6 位验证码。应急密码是不走验证码的后备入口，仅作找回用。
           </p>
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Client ID">
-            <Input value={String(s.github_client_id ?? "")} onChange={(e) => set("github_client_id", e.target.value)} />
-          </Field>
-          <Field label="Client Secret" hint={s.github_secret_set ? "已设置，留空不变" : "未设置"}>
-            <Input type="password" placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => set("github_client_secret", e.target.value)} />
-          </Field>
-        </div>
-        {String(s.github_client_id ?? "") !== "" && String(s.github_allowed_users ?? "").trim() === "" && (
-          <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            白名单为空，GitHub 登录拒绝所有人。填入用户名并保存后生效。
+        {totpOn && !binding && (
+          <p className="flex items-center gap-2 text-sm">
+            <Badge>已开启</Badge>
+            <span className="text-muted-foreground">登录时需要验证码</span>
           </p>
         )}
-        <Field label="允许登录的 GitHub 用户名" hint="逗号分隔。留空 = 拒绝所有人，不是放行所有人">
-          <Input value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="GitHub 用户名" />
-        </Field>
-        <div>
-          <Button
-            size="sm"
-            onClick={() => {
-              const patch: Record<string, string> = {
-                github_client_id: String(s.github_client_id ?? ""),
-                github_allowed_users: String(s.github_allowed_users ?? ""),
-              }
-              if (typeof s.github_client_secret === "string" && s.github_client_secret) {
-                patch.github_client_secret = s.github_client_secret
-              }
-              save(patch)
-            }}
-          >
-            保存 GitHub 设置
-          </Button>
-        </div>
+        {binding ? (
+          <div className="grid gap-4 sm:grid-cols-[auto_1fr]">
+            {/* The otpauth URL as a QR: typing a 32-character secret by hand
+                is how binding fails on a phone. */}
+            <img src={binding.qr} alt="验证器二维码" className="size-48 rounded-md border" />
+            <div className="space-y-4">
+              <Field label="验证器密钥" hint="扫不了码时手动输入这串密钥">
+                <div className="flex gap-2">
+                  <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs select-all">
+                    {binding.secret}
+                  </code>
+                  <Button size="sm" variant="outline" onClick={() => copy(binding.secret)}>
+                    <Copy className="size-4" />
+                  </Button>
+                </div>
+              </Field>
+              <Field label="输入 App 显示的 6 位验证码完成绑定">
+                <div className="flex gap-2">
+                  <Input
+                    inputMode="numeric"
+                    placeholder="000000"
+                    value={code}
+                    onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    className="w-28 font-mono"
+                  />
+                  <Button size="sm" disabled={busy || code.length !== 6} onClick={confirmTotp}>
+                    确认开启
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setBinding(null)}>取消</Button>
+                </div>
+              </Field>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {totpOn ? (
+              <Button size="sm" variant="destructive" disabled={busy} onClick={() => setConfirmOff(true)}>
+                关闭两步验证
+              </Button>
+            ) : (
+              <Button size="sm" disabled={busy} onClick={beginTotp}>
+                开启两步验证
+              </Button>
+            )}
+          </div>
+        )}
       </Card>
 
       <Card className="gap-4 p-5">
         <div>
-          <h3 className="text-sm font-medium">应急密码</h3>
+          <h3 className="text-sm font-medium">密码</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            GitHub 不可用时的备用入口。修改后其它设备登录立即失效，当前设备不受影响。
+            登录的主密码。修改后其它设备登录立即失效，当前设备不受影响。
           </p>
         </div>
         <Field label="新密码" hint="至少 12 位">
@@ -1676,6 +1944,38 @@ function Security({ site }: { site: string }) {
           </Button>
         </div>
       </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">应急密码</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            丢失验证器时的后备入口：用它可以不输验证码登录（会推送一条登录提醒）。找回后请重新绑定两步验证。留空保存即清除。
+          </p>
+        </div>
+        <Field label={s.emergency_password_set ? "新应急密码（留空保存 = 清除）" : "应急密码"} hint={s.emergency_password_set ? "已设置" : "未设置，建议设置一个以防验证器丢失"}>
+          <Input type="password" value={recovery} onChange={(e) => setRecovery(e.target.value)} autoComplete="new-password" />
+        </Field>
+        <div>
+          <Button
+            size="sm"
+            disabled={recovery.length > 0 && recovery.length < 12}
+            onClick={() => save({ emergency_password: recovery }).then(() => setRecovery(""))}
+          >
+            {recovery ? "保存应急密码" : s.emergency_password_set ? "清除应急密码" : "保存应急密码"}
+          </Button>
+        </div>
+      </Card>
+
+      {confirmOff && (
+        <ConfirmDialog
+          title="关闭两步验证？"
+          description="关闭后登录只需密码。应急密码等所有登录方式都不再要求验证码。"
+          confirmLabel="关闭两步验证"
+          busy={busy}
+          onClose={() => setConfirmOff(false)}
+          onConfirm={disableTotp}
+        />
+      )}
     </div>
   )
 }
@@ -1688,6 +1988,7 @@ type DbInfo = {
   /** Timestamp of the earliest history row, null on a database with none. */
   oldest: number | null
   retention: number
+  retention_ping: number
   rows: Record<string, number>
 }
 
@@ -1700,6 +2001,7 @@ const DB_ROWS: [string, string][] = [
 
 function Data() {
   const [info, setInfo] = useState<DbInfo | null>(null)
+  const { s, set, save } = useSettings()
   const [busy, setBusy] = useState("")
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
@@ -1764,7 +2066,8 @@ function Data() {
           {stat("文件大小", bytes(info.size))}
           {stat("预写日志", bytes(info.wal))}
           {stat("可回收空间", bytes(info.free))}
-          {stat("保留天数", `${info.retention} 天`)}
+          {stat("服务器数据保留", `${info.retention} 天`)}
+          {stat("延迟数据保留", `${info.retention_ping} 天`)}
           {/* 和保留天数并排：跨度小于保留期是还没攒够，大于保留期就是每小时
               那次 prune 没在跑。 */}
           {stat("历史跨度", info.oldest ? `${Math.floor((Date.now() / 1000 - info.oldest) / 86400)} 天` : "—")}
@@ -1774,6 +2077,48 @@ function Data() {
           <code>{info.path}</code>
         </p>
       </Card>
+
+      {s && (
+        <Card className="gap-4 p-5">
+          <div>
+            <h3 className="text-sm font-medium">历史数据保留</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              两类明细各自保留这么多天，超出部分在每小时的清理中删除。累计流量不受影响。
+            </p>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="服务器数据（天）" hint="CPU / 内存 / 网络等指标明细">
+              <Input
+                type="number"
+                value={String(s.retention_metrics_days ?? "7")}
+                onChange={(e) => set("retention_metrics_days", e.target.value)}
+                placeholder="7"
+              />
+            </Field>
+            <Field label="延迟检测数据（天）" hint="各监控目标的探测记录">
+              <Input
+                type="number"
+                value={String(s.retention_ping_days ?? "7")}
+                onChange={(e) => set("retention_ping_days", e.target.value)}
+                placeholder="7"
+              />
+            </Field>
+          </div>
+          <div>
+            <Button
+              size="sm"
+              onClick={() =>
+                save({
+                  retention_metrics_days: String(s.retention_metrics_days || "7"),
+                  retention_ping_days: String(s.retention_ping_days || "7"),
+                })
+              }
+            >
+              保存保留设置
+            </Button>
+          </div>
+        </Card>
+      )}
 
       <Card className="gap-4 p-5">
         <div>
@@ -1794,8 +2139,8 @@ function Data() {
         <div>
           <h3 className="text-sm font-medium">备份</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
-            当前节点、设置、历史全部作废，所有设备需要重新登录。
+            导出的是整个数据库，含服务器凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
+            当前服务器、设置、历史全部作废，所有设备需要重新登录。
             <br />
             请用这里导出的文件恢复：直接复制 <code>monitor.db</code> 会丢掉预写日志里还没落盘的那部分。
           </p>
@@ -1837,7 +2182,7 @@ function Data() {
       {pending && (
         <ConfirmDialog
           title="用备份覆盖当前数据？"
-          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的节点、设置和历史全部丢失，且无法撤销。`}
+          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的服务器、设置和历史全部丢失，且无法撤销。`}
           confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
           busy={!!busy}
           onClose={() => { abort.current?.abort(); setPending(null) }}
@@ -1851,7 +2196,7 @@ function Data() {
 // Each area is its own route rather than a tab, so a page can be linked to and a
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
-  { path: "/admin/nodes", label: "节点", icon: Server },
+  { path: "/admin/nodes", label: "服务器", icon: Server },
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/data", label: "数据", icon: Database },
@@ -1906,7 +2251,7 @@ export function Admin({
         ) : path === "/admin/themes" ? (
           <Themes />
         ) : path === "/admin/security" ? (
-          <Security site={site} />
+          <Security />
         ) : path === "/admin/settings" ? (
           <SettingsTab />
         ) : (

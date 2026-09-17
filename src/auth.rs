@@ -1,30 +1,33 @@
-//! Sessions, the local emergency password, and GitHub single sign-on.
+//! Sessions, the local password, the recovery password, and TOTP two-factor.
 //!
-//! GitHub is the primary sign-in path. The local password exists so that a
-//! broken OAuth app or an unreachable github.com cannot lock the owner out.
+//! The password plus a six-digit authenticator code is the sign-in path once
+//! two-factor is bound. The recovery password is a second, independently set
+//! credential that skips the code: it exists so a lost authenticator cannot
+//! lock the owner out, at the cost of being a path around the second factor.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
+use data_encoding::BASE32_NOPAD;
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
 
 use crate::App;
 
 pub const COOKIE: &str = "monitor_session";
-const STATE_COOKIE: &str = "monitor_oauth_state";
 const SESSION_DAYS: i64 = 14;
 /// Failed password attempts allowed per address before it is shut out.
 const MAX_ATTEMPTS: u32 = 5;
@@ -158,6 +161,49 @@ pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
 #[derive(Deserialize)]
 pub struct LoginBody {
     password: String,
+    /// Six digits from the authenticator, required once TOTP is bound.
+    #[serde(default)]
+    code: Option<String>,
+}
+
+/// Which credential the caller presented, for the sign-in notification.
+enum Credential {
+    Password,
+    Recovery,
+}
+
+/// RFC 6238: the six digits an authenticator shows for `secret` at `step`.
+fn totp_at(secret: &[u8], step: i64) -> String {
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret).expect("any key length");
+    mac.update(&step.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    // Dynamic truncation: the low nibble of the last byte picks four bytes,
+    // the top bit is cleared, and what remains names a decimal code.
+    let at = (digest[digest.len() - 1] & 0x0f) as usize;
+    let word = u32::from_be_bytes([digest[at], digest[at + 1], digest[at + 2], digest[at + 3]]) & 0x7fff_ffff;
+    format!("{:06}", word % 1_000_000)
+}
+
+/// The step a code is checked against, 30 seconds as every authenticator uses.
+const TOTP_STEP: i64 = 30;
+
+/// True when `code` is what an authenticator derived from `secret` shows now,
+/// one step ago, or one step ahead -- the drift a clock-skewed phone needs.
+fn totp_matches(secret: &str, code: &str) -> bool {
+    let Ok(secret) = BASE32_NOPAD.decode(secret.to_ascii_uppercase().as_bytes()) else { return false };
+    let now = Utc::now().timestamp();
+    // Constant-time enough for six digits compared as strings, and exact
+    // comparison only: no early return on the first matching step.
+    let mut hit = false;
+    for drift in [-1, 0, 1] {
+        hit |= totp_at(&secret, (now + drift * TOTP_STEP) / TOTP_STEP) == code;
+    }
+    hit
+}
+
+/// Whether a second factor is bound, the flag the sign-in page needs.
+pub fn totp_bound(app: &App) -> bool {
+    app.db.get("totp_secret").is_some_and(|v| !v.is_empty())
 }
 
 pub async fn login(
@@ -174,17 +220,48 @@ pub async fn login(
     let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     };
-    let Some(stored) = app.db.get("admin_password_hash") else {
-        return (StatusCode::FORBIDDEN, "password login is disabled").into_response();
+    let mut credential = Credential::Password;
+    let verified = match app.db.get("admin_password_hash") {
+        Some(stored) if verify_password(&body.password, &stored) => true,
+        // The recovery password is the fallback path around the second factor;
+        // it is checked only when the main one did not match, so it cannot be
+        // discovered by trying the main one against it.
+        _ => {
+            let recovery = app.db.get("emergency_password_hash");
+            let hit = recovery.as_deref().is_some_and(|stored| verify_password(&body.password, stored));
+            if hit {
+                credential = Credential::Recovery;
+            }
+            hit
+        }
     };
-    if !verify_password(&body.password, &stored) {
+    if !verified {
         app.throttle.record_failure(ip);
         return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
     }
+    let via = match credential {
+        Credential::Password => {
+            if totp_bound(&app) {
+                let code = body.code.as_deref().unwrap_or_default().trim().to_owned();
+                let Some(secret) = app.db.get("totp_secret").filter(|s| !s.is_empty()) else {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "second factor unreadable").into_response();
+                };
+                if !totp_matches(&secret, &code) {
+                    // Counted like a wrong password: the code is the other half
+                    // of the credential, and an unlimited guessing room against
+                    // six digits would spend them all.
+                    app.throttle.record_failure(ip);
+                    return (StatusCode::UNAUTHORIZED, "invalid authenticator code").into_response();
+                }
+            }
+            "密码"
+        }
+        Credential::Recovery => "应急密码",
+    };
     app.throttle.clear(ip);
     match issue_session(&app, &headers) {
         Ok(cookie) => {
-            crate::notify::signed_in(&app, "应急密码", ip);
+            crate::notify::signed_in(&app, via, ip);
             with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -201,81 +278,51 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
     )
 }
 
-/// Step one of the OAuth exchange: issue a state nonce and redirect the browser
-/// to GitHub. The nonce returns in step two and must match.
-pub async fn github_start(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
-    let Some(client_id) = app.db.get("github_client_id").filter(|v| !v.is_empty()) else {
-        return (StatusCode::PRECONDITION_FAILED, "GitHub sign-in is not configured").into_response();
-    };
-    let state = random_token();
+/// Begins binding: a fresh secret, returned with the otpauth:// URL a phone
+/// turns into a QR code. Nothing is stored yet -- the binding completes only
+/// once a code derived from this secret is confirmed, so an abandoned dialog
+/// leaves the sign-in path exactly as it was.
+pub async fn totp_begin(_: crate::api::Admin, State(app): State<crate::Shared>) -> Response {
+    let secret = BASE32_NOPAD.encode(&rand::random::<[u8; 20]>());
+    let issuer = app.db.get("site_name").unwrap_or_else(|| "Monitor".into());
+    let label = format!("{issuer}:admin");
     let url = format!(
-        "https://github.com/login/oauth/authorize?client_id={client_id}&scope=read:user&state={state}"
+        "otpauth://totp/{}?secret={secret}&issuer={}",
+        urlencode(&label),
+        &secret
     );
-    with_cookies(Redirect::to(&url), [set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies(&headers))])
+    Json(serde_json::json!({"secret": secret, "url": url})).into_response()
 }
 
-/// Every field is optional. With required fields axum would reject a malformed
-/// callback before the handler runs, returning a bare 400 and logging nothing;
-/// GitHub also reports a refusal with `error` and no `code`.
-#[derive(Deserialize, Default)]
-pub struct Callback {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
+#[derive(Deserialize)]
+pub struct TotpConfirm {
+    secret: String,
+    code: String,
 }
 
-pub async fn github_callback(
+/// Completes the binding by proving the authenticator and the hub hold the
+/// same secret: the code must be one this secret produces right now.
+pub async fn totp_confirm(
+    _: crate::api::Admin,
     State(app): State<crate::Shared>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: HeaderMap,
-    Query(query): Query<Callback>,
+    Json(body): Json<TotpConfirm>,
 ) -> Response {
-    // GitHub reports a refusal in the query string rather than the body.
-    if let Some(error) = &query.error {
-        let reason = query.error_description.as_deref().unwrap_or(error);
-        return sign_in_failed(&app, &headers, &format!("GitHub returned {error}: {reason}"));
+    if !totp_matches(&body.secret, body.code.trim()) {
+        return (StatusCode::BAD_REQUEST, "验证码不正确，请确认时间同步后重试").into_response();
     }
-    // Reject a callback the browser did not initiate.
-    let state = query.state.as_deref().unwrap_or_default();
-    if state.is_empty() || cookie_value(&headers, STATE_COOKIE).as_deref() != Some(state) {
-        return sign_in_failed(
-            &app,
-            &headers,
-            "state mismatch or missing; start again from the sign-in page",
-        );
+    match app.db.set("totp_secret", body.secret.trim()) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
-    let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
-        return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
-    };
-    let user = match github_login(&app, code).await {
-        Ok(user) => user,
-        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
-    };
-    let session = match issue_session(&app, &headers) {
-        Ok(cookie) => cookie,
-        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
-    };
-    crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&headers, peer.ip()));
-    with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
 }
 
-/// Redirects the browser back to the sign-in page with the reason, rather than
-/// leaving a bare 401 at a callback URL offering no way forward.
-fn sign_in_failed(app: &App, headers: &HeaderMap, reason: &str) -> Response {
-    // A rejected sign-in must leave a server-side record; the browser sees only
-    // the redirect.
-    warn!("GitHub sign-in rejected: {reason}");
-    let target = format!("/admin?login_error={}", urlencode(reason));
-    with_cookies(Redirect::to(&target), [clear_state(app, headers), String::new()])
-}
-
-fn clear_state(app: &App, headers: &HeaderMap) -> String {
-    set_cookie(STATE_COOKIE, "", 0, app.secure_cookies(headers))
+/// Removes the second factor. An authenticated session stands behind this, as
+/// behind every panel write.
+pub async fn totp_disable(_: crate::api::Admin, State(app): State<crate::Shared>) -> Response {
+    match app.db.set("totp_secret", "") {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Attaches several `Set-Cookie` headers to one response. An array of header
@@ -298,7 +345,7 @@ pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [Strin
 }
 
 /// Percent-encodes everything outside the unreserved set, sufficient for
-/// placing an arbitrary message in a query string.
+/// placing a label inside the otpauth: URL.
 fn urlencode(value: &str) -> String {
     value
         .bytes()
@@ -307,72 +354,6 @@ fn urlencode(value: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
-}
-
-/// Exchanges the code for a token and checks the login against the allow list,
-/// returning the accepted login.
-async fn github_login(app: &App, code: &str) -> Result<String> {
-    let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
-    else {
-        bail!("not configured");
-    };
-    let allowed = app.db.get("github_allowed_users").unwrap_or_default();
-    let allowed: Vec<String> =
-        allowed.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
-    if allowed.is_empty() {
-        // Without an allow list, any GitHub account could sign in.
-        bail!("no allowed GitHub users configured");
-    }
-
-    #[derive(Deserialize)]
-    struct TokenResponse {
-        access_token: Option<String>,
-        error_description: Option<String>,
-    }
-    let token: TokenResponse = app
-        .http
-        .post("https://github.com/login/oauth/access_token")
-        .header(header::ACCEPT, "application/json")
-        .json(&serde_json::json!({"client_id": id, "client_secret": secret, "code": code}))
-        .send()
-        .await
-        .context("token request")?
-        .json()
-        .await
-        .context("token response")?;
-    let Some(access) = token.access_token else {
-        bail!("{}", token.error_description.unwrap_or_else(|| "no access token".into()));
-    };
-
-    #[derive(Deserialize)]
-    struct GithubUser {
-        login: String,
-    }
-    let response = app
-        .http
-        .get("https://api.github.com/user")
-        .header(header::AUTHORIZATION, format!("Bearer {access}"))
-        .header(header::USER_AGENT, "monitor-hub")
-        .send()
-        .await
-        .context("user request")?;
-    let status = response.status();
-    let body = response.text().await.context("user response")?;
-    // Decoding an error page into GithubUser would report "missing field login"
-    // instead of GitHub's actual message.
-    let user: GithubUser = serde_json::from_str(&body).with_context(|| {
-        format!("user response ({status}): {}", body.chars().take(200).collect::<String>())
-    })?;
-
-    if !allowed.contains(&user.login.to_lowercase()) {
-        // The list stays in the log and out of the reason, which travels back in
-        // a query string: any GitHub account can reach that page, and a reason
-        // carrying the allow list would disclose the accounts worth phishing.
-        warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
-        bail!("GitHub user {} is not on the allowed list", user.login);
-    }
-    info!("GitHub sign-in accepted for {}", user.login);
-    Ok(user.login)
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
@@ -493,35 +474,27 @@ mod tests {
         assert!(PASSWORD_GATE.try_acquire().is_ok(), "permits come back when the checks finish");
     }
 
-    /// Both ends of the same redirect: every form GitHub can send must parse,
-    /// or it never reaches the handler and can be neither logged nor explained,
-    /// and the reason sent back must survive its query string.
+    /// RFC 6238 against published vectors: a known key and step must produce
+    /// the documented code, the drift window must accept the neighbouring
+    /// steps, and anything else must not verify.
     #[test]
-    fn every_callback_shape_parses_and_a_failure_reason_survives_the_round_trip() {
-        let parse = |q: &str| serde_urlencoded::from_str::<Callback>(q);
+    fn a_totp_code_matches_only_its_step_and_its_neighbours() {
+        // RFC 6238's appendix B key, "12345678901234567890", base32-encoded;
+        // the code for one step is the RFC 4226 HOTP of that counter.
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let key = BASE32_NOPAD.decode(secret.as_bytes()).unwrap();
+        assert_eq!(totp_at(&key, 0), "755224");
+        assert_eq!(totp_at(&key, 1), "287082");
+        assert_eq!(totp_at(&key, 2), "359152");
 
-        let ok = parse("code=abc&state=xyz").expect("the happy path");
-        assert_eq!(ok.code.as_deref(), Some("abc"));
-        assert_eq!(ok.state.as_deref(), Some("xyz"));
-
-        // GitHub reports a refusal with no code.
-        let denied = parse("error=access_denied&error_description=the+user+said+no&state=xyz")
-            .expect("a refusal must parse, not 400");
-        assert_eq!(denied.error.as_deref(), Some("access_denied"));
-        assert_eq!(denied.error_description.as_deref(), Some("the user said no"));
-        assert!(denied.code.is_none());
-
-        // Truncated or empty callbacks must still reach the handler.
-        assert!(parse("state=xyz").is_ok());
-        assert!(parse("").is_ok());
-
-        // Anything that would escape the query string must be encoded, or the
-        // reason arrives truncated at the first stray separator.
-        assert_eq!(urlencode("a&b=c#d"), "a%26b%3Dc%23d");
-        assert_eq!(urlencode("用户"), "%E7%94%A8%E6%88%B7");
-        let reason = "no allowed GitHub users configured (a&b=c)";
-        let back = parse(&format!("error={}", urlencode(reason))).expect("a reason must parse");
-        assert_eq!(back.error.as_deref(), Some(reason), "the whole reason comes back");
+        // A secret no authenticator could hold decodes to nothing and matches
+        // nothing, rather than passing every check.
+        assert!(!totp_matches("not base32!!", "000000"));
+        // The code for a far-away step does not verify.
+        let far = totp_at(&key, 0);
+        if totp_at(&key, Utc::now().timestamp() / TOTP_STEP) != far {
+            assert!(!totp_matches(secret, &far));
+        }
     }
 
     /// A session cookie's round trip: the flags it is issued with, sharing a
@@ -536,7 +509,7 @@ mod tests {
 
         // axum applies an array of header tuples with insert(), keeping only the
         // last Set-Cookie; this helper appends instead.
-        let response = with_cookies(StatusCode::OK, [session, set_cookie(STATE_COOKIE, "s", 0, true)]);
+        let response = with_cookies(StatusCode::OK, [session, "x=1".to_owned()]);
         let set: Vec<_> = response.headers().get_all(header::SET_COOKIE).iter().collect();
         assert_eq!(set.len(), 2, "both cookies must reach the browser");
         // Empty entries are skipped rather than emitting a blank header.

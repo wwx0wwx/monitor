@@ -12,6 +12,7 @@ fn main() {
     // failure inside rust-embed.
     println!("cargo:rerun-if-changed=web-theme.pin");
     println!("cargo:rerun-if-changed=target/theme/.pin");
+    println!("cargo:rerun-if-changed=vendor/theme/.pin");
     println!("cargo:rerun-if-changed=scripts/theme.sh");
 
     match Command::new("sh").arg("scripts/theme.sh").status() {

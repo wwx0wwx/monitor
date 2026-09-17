@@ -1,9 +1,11 @@
 //! SQLite storage. A single writer connection behind a mutex: at a handful of
 //! nodes reporting every few seconds, every statement here is sub-millisecond.
-// ponytail: single global connection; move to a read pool if the dashboard ever
-// blocks behind ingest.
+//! Reads go through a small pool of further connections: in WAL mode they run
+//! beside the writer without blocking it, so a dashboard chart no longer holds
+//! up the agents' reports (the single-connection design this grew out of did).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -12,7 +14,20 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-pub struct Db(Mutex<Connection>);
+/// How many read connections the pool holds. Chart windows are the widest
+/// queries the panel makes; four keep several of them from queueing behind one
+/// another, without spending a per-connection page cache on more.
+const READERS: usize = 4;
+
+pub struct Db {
+    write: Mutex<Connection>,
+    /// The pool, absent for a private `:memory:` database where a second
+    /// connection would see no tables at all.
+    readers: Option<Vec<Mutex<Connection>>>,
+    /// Round-robin cursor over the pool. Wrapping is harmless: it only picks
+    /// which connection the next read takes.
+    cursor: AtomicUsize,
+}
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -68,6 +83,12 @@ CREATE TABLE IF NOT EXISTS node (
   -- rather than held in memory so that a hub restart neither repeats the alert
   -- nor loses the recovery that pairs with it.
   down_since INTEGER NOT NULL DEFAULT 0,
+  -- Semicolon-separated badges the public page shows on the card, komari style:
+  -- "dedicated;16v;32g;16T". Operator-supplied and public by intent.
+  tag TEXT NOT NULL DEFAULT '',
+  -- Filter dimension for the panel and the public page. Named `node_group`
+  -- because `group` is reserved in SQL. Empty means no group.
+  node_group TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 
@@ -128,7 +149,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -230,6 +251,11 @@ fn migrate_to_4(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "down_since INTEGER NOT NULL DEFAULT 0")
 }
 
+fn migrate_to_5(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "tag TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "node_group TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -248,6 +274,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 4 {
         migrate_to_4(conn)?;
+    }
+    if from < 5 {
+        migrate_to_5(conn)?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
@@ -332,6 +361,13 @@ pub struct Node {
     /// install command on demand; it never leaves the admin view.
     #[serde(default)]
     pub token: String,
+    /// Semicolon-separated badges for the public card, e.g.
+    /// "dedicated;16v;32g;16T". Public by intent.
+    #[serde(default)]
+    pub tag: String,
+    /// Filter dimension for the panel and the public page; empty means none.
+    #[serde(default, rename = "group")]
+    pub node_group: String,
 }
 
 fn yes() -> bool {
@@ -354,6 +390,9 @@ pub struct NodePatch {
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
     pub notify: Option<bool>,
+    pub tag: Option<String>,
+    #[serde(default, rename = "group")]
+    pub node_group: Option<String>,
 }
 
 fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
@@ -438,6 +477,18 @@ fn bytes_of(file: &str) -> i64 {
     std::fs::metadata(file).map(|m| m.len() as i64).unwrap_or(0)
 }
 
+/// One pooled read connection: the same tuning the writer carries, so a reader
+/// that meets a checkpoint waits out the busy timeout rather than failing, and
+/// keeps its own page cache of the rows the charts revisit.
+fn reader(path: &str) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA cache_size = -8192;",
+    )?;
+    Ok(conn)
+}
+
 /// Bytes the database occupies. The WAL is included: committed rows remain there
 /// until a checkpoint folds them into the main file, so the two together are what
 /// an operator sees on disk.
@@ -476,17 +527,58 @@ impl Db {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
-        Ok(Self(Mutex::new(conn)))
+        // The retention window was one setting until it split in two. Both
+        // halves start from the old value so an upgrade keeps the window the
+        // operator chose; a fresh database writes nothing and reads defaults.
+        if conn.query_row("SELECT COUNT(*) FROM setting WHERE key='retention_days'", [], |r| {
+            r.get::<_, i64>(0)
+        })? > 0
+        {
+            for key in ["retention_metrics_days", "retention_ping_days"] {
+                let missing = conn
+                    .query_row("SELECT COUNT(*) FROM setting WHERE key=?1", [key], |r| r.get::<_, i64>(0))?
+                    == 0;
+                if missing {
+                    conn.execute(
+                        "INSERT INTO setting (key, value)
+                         SELECT ?1, value FROM setting WHERE key='retention_days'",
+                        [key],
+                    )?;
+                }
+            }
+        }
+        // The pool opens only against a file: a `:memory:` database is private
+        // to the connection that created it, which in practice means a test.
+        let mut pool = Vec::with_capacity(READERS);
+        if path != ":memory:" {
+            for _ in 0..READERS {
+                pool.push(Mutex::new(reader(path)?));
+            }
+        }
+        let readers = (!pool.is_empty()).then_some(pool);
+        Ok(Self { write: Mutex::new(conn), readers, cursor: AtomicUsize::new(0) })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.write.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A connection for a statement that only reads.
+    ///
+    /// WAL mode lets these run alongside the writer, so the wide chart queries
+    /// stop queueing behind every agent report. Round-robin over the pool; with
+    /// no pool the writer stands in, which is the `:memory:` test case and
+    /// exactly the behaviour the pool replaced.
+    fn read(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let Some(pool) = &self.readers else { return self.conn() };
+        let at = self.cursor.fetch_add(1, Ordering::Relaxed) % pool.len();
+        pool[at].lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ---- settings ----
 
     pub fn get(&self, key: &str) -> Option<String> {
-        self.conn()
+        self.read()
             .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0))
             .optional()
             .ok()
@@ -505,7 +597,7 @@ impl Db {
     // ---- nodes ----
 
     pub fn nodes(&self) -> Result<Vec<Node>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT * FROM node ORDER BY sort, id")?;
         let rows = stmt.query_map([], |r| Ok(row_to_node(r)))?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -529,8 +621,9 @@ impl Db {
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
-                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day,
+                               tag, node_group, created_at)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 n.name,
                 token,
@@ -543,6 +636,8 @@ impl Db {
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
+                n.tag,
+                n.node_group,
                 Utc::now().timestamp()
             ],
         )?;
@@ -555,7 +650,7 @@ impl Db {
     /// How many nodes were created at or after `ts`. Bounds what one registration
     /// window can add; see `api::REGISTER_LIMIT`.
     pub fn nodes_created_since(&self, ts: i64) -> Result<i64> {
-        Ok(self.conn().query_row("SELECT COUNT(*) FROM node WHERE created_at >= ?1", [ts], |r| r.get(0))?)
+        Ok(self.read().query_row("SELECT COUNT(*) FROM node WHERE created_at >= ?1", [ts], |r| r.get(0))?)
     }
 
     /// Records that the node reported. Written on the same cadence as the metric
@@ -575,7 +670,8 @@ impl Db {
                              remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
                              traffic_mode=COALESCE(?12,traffic_mode),
                              traffic_reset_day=COALESCE(?13,traffic_reset_day),
-                             notify=COALESCE(?14,notify)
+                             notify=COALESCE(?14,notify), tag=COALESCE(?15,tag),
+                             node_group=COALESCE(?16,node_group)
              WHERE id=?1",
             params![
                 id,
@@ -591,7 +687,9 @@ impl Db {
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
-                n.notify
+                n.notify,
+                n.tag,
+                n.node_group
             ],
         )?;
         Ok(found > 0)
@@ -645,7 +743,7 @@ impl Db {
     }
 
     pub fn node_by_token(&self, token: &str) -> Result<Option<i64>> {
-        Ok(self.conn().query_row("SELECT id FROM node WHERE token = ?1", [token], |r| r.get(0)).optional()?)
+        Ok(self.read().query_row("SELECT id FROM node WHERE token = ?1", [token], |r| r.get(0)).optional()?)
     }
 
     /// Stores the slow-changing facts an agent sends on connect, and reports
@@ -722,7 +820,7 @@ impl Db {
     /// offline since before a boundary still holds the previous period's bytes on
     /// disk. This is the only reader, so the rule lives in one place.
     pub fn all_traffic(&self) -> HashMap<i64, Traffic> {
-        let conn = self.conn();
+        let conn = self.read();
         let Ok(mut stmt) = conn.prepare_cached(
             "SELECT t.node_id, t.total_rx, t.total_tx, t.month_rx, t.month_tx, t.month_start,
                     t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
@@ -952,7 +1050,7 @@ impl Db {
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
     pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
                     CAST(AVG(disk_used) AS INTEGER),
@@ -969,20 +1067,20 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Drops history beyond the retention window. Traffic totals live in their
+    /// Drops history beyond each retention window. Traffic totals live in their
     /// own table precisely so history can be pruned freely.
-    pub fn prune(&self, keep_days: i64) -> Result<usize> {
-        let cutoff = Utc::now().timestamp() - keep_days * 86_400;
+    pub fn prune(&self, keep_metrics: i64, keep_ping: i64) -> Result<usize> {
+        let now = Utc::now().timestamp();
         let conn = self.conn();
-        let a = conn.execute("DELETE FROM metric WHERE ts < ?1", [cutoff])?;
-        let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [cutoff])?;
+        let a = conn.execute("DELETE FROM metric WHERE ts < ?1", [now - keep_metrics * 86_400])?;
+        let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [now - keep_ping * 86_400])?;
         Ok(a + b)
     }
 
     // ---- ping ----
 
     pub fn ping_tasks(&self) -> Result<Vec<PingTask>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT id, name, target, interval FROM ping_task ORDER BY id")?;
         let tasks: Vec<PingTask> = stmt
             .query_map([], |r| {
@@ -1043,7 +1141,7 @@ impl Db {
             // The foreign key is the check; naming the node turns SQLite's
             // "FOREIGN KEY constraint failed" into something the panel can show.
             tx.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])
-                .with_context(|| format!("节点 {node} 不存在"))?;
+                .with_context(|| format!("服务器 {node} 不存在"))?;
         }
         // Queried from the table after the rows are in rather than counted from
         // the request: an update replaces this task's own assignments, so
@@ -1059,12 +1157,35 @@ impl Db {
             .optional()?;
         if let Some(node) = crowded {
             anyhow::bail!(
-                "节点 {node} 会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
+                "服务器 {node} 会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
                 Self::MAX_PROBES_PER_NODE
             );
         }
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Assigns one node to every existing probe, for the setting that puts new
+    /// servers into the latency queue automatically.
+    ///
+    /// Guarded by the same per-node ceiling `save_ping_task` enforces: a hub
+    /// with more probes than an agent will run keeps the newest server out
+    /// rather than silently overrunning the agent's backstop. The caller pushes
+    /// the new list to the agents.
+    pub fn assign_node_to_all_ping_tasks(&self, node_id: i64) -> Result<()> {
+        let conn = self.conn();
+        let tasks: i64 = conn.query_row("SELECT COUNT(*) FROM ping_task", [], |r| r.get(0))?;
+        if tasks > Self::MAX_PROBES_PER_NODE {
+            anyhow::bail!(
+                "已有 {tasks} 个探测任务，超过 agent 单服务器上限 {}，新服务器未自动加入",
+                Self::MAX_PROBES_PER_NODE
+            );
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO ping_node (task_id, node_id) SELECT id, ?1 FROM ping_task",
+            [node_id],
+        )?;
+        Ok(())
     }
 
     /// Deletes a probe and the results filed under it.
@@ -1094,7 +1215,7 @@ impl Db {
     /// and this makes the backstop deterministic should a database arrive there
     /// by another route.
     pub fn ping_tasks_for(&self, node_id: i64) -> Result<Vec<serde_json::Value>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT t.id, t.target, t.interval FROM ping_task t
              JOIN ping_node n ON n.task_id = t.id WHERE n.node_id = ?1 ORDER BY t.id",
@@ -1116,7 +1237,7 @@ impl Db {
     /// routinely carries a hostname or a customer, and the rest of the table
     /// belongs to nodes this caller may not be able to see.
     pub fn ping_task_names(&self, node_id: i64) -> Result<serde_json::Value> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT id, name FROM ping_task WHERE id IN (SELECT task_id FROM ping_node WHERE node_id=?1)",
         )?;
@@ -1132,7 +1253,6 @@ impl Db {
     /// Files one probe result, and only under a probe this node is assigned. A
     /// result for anything else is dropped rather than treated as an error, since
     /// the agent can do nothing useful with the distinction.
-    ///
     /// The assignment is tested inside the statement because that is the only
     /// place it is atomic with the write: `ping_record` carries no foreign key,
     /// being WITHOUT ROWID and keyed for the chart query. Two cases arrive
@@ -1183,7 +1303,7 @@ impl Db {
         since: i64,
         step: i64,
     ) -> Result<(Vec<serde_json::Value>, serde_json::Value)> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare_cached(PING_ROWS)?;
         let mut rows = stmt.query(params![node_id, since, step])?;
         let mut out = Vec::new();
@@ -1236,14 +1356,19 @@ impl Db {
 
     /// The file this connection is open on, empty for `:memory:`.
     pub fn file(&self) -> String {
-        main_file(&self.conn())
+        main_file(&self.read())
     }
 
-    /// The retention window used by both `prune` and the data page. Stored as
-    /// text by the settings form, so a missing or unparsable value falls back to
-    /// the default rather than erroring.
-    pub fn retention_days(&self) -> i64 {
-        self.get("retention_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(7).clamp(1, 3_650)
+    /// The retention window for server metrics, in days. Stored as text by the
+    /// data page, so a missing or unparsable value falls back to the default
+    /// rather than erroring.
+    pub fn retention_metrics_days(&self) -> i64 {
+        self.get("retention_metrics_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(7).clamp(1, 3_650)
+    }
+
+    /// The same window for latency history; the two are pruned separately.
+    pub fn retention_ping_days(&self) -> i64 {
+        self.get("retention_ping_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(7).clamp(1, 3_650)
     }
 
     /// What the panel's data page reads: how much space the file occupies, how
@@ -1253,16 +1378,16 @@ impl Db {
     /// `oldest` against `retention` is the one pair here that can indicate a
     /// fault: history older than the window means `prune` has not been running.
     pub fn stats(&self) -> Result<serde_json::Value> {
-        // Before acquiring the connection: `conn()` returns a guard on a plain
-        // Mutex, and `retention_days` acquires the same one.
-        let retention = self.retention_days();
-        let conn = self.conn();
+        // Before acquiring the connection: a guard on a plain Mutex must not be
+        // taken twice by one thread, and the retention reads take one too.
+        let (retention_metrics, retention_ping) =
+            (self.retention_metrics_days(), self.retention_ping_days());
+        let conn = self.read();
         let file = main_file(&conn);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
-        // Both are pruned at the same cutoff, so the earlier of the two marks
-        // where history begins. A full scan of each, which the counts below
-        // already incur.
+        // Pruned at different cutoffs now, so the earlier of the two marks where
+        // history begins. A full scan of each, which the counts below incur.
         let oldest: Option<i64> = conn.query_row(
             "SELECT MIN(ts) FROM (SELECT MIN(ts) AS ts FROM metric UNION ALL SELECT MIN(ts) FROM ping_record)",
             [],
@@ -1279,7 +1404,8 @@ impl Db {
             "wal": bytes_of(&format!("{file}-wal")),
             "free": free_pages * page_size,
             "oldest": oldest,
-            "retention": retention,
+            "retention": retention_metrics,
+            "retention_ping": retention_ping,
             "rows": rows,
         }))
     }
@@ -1447,7 +1573,7 @@ impl Db {
     }
 
     pub fn session_valid(&self, token_hash: &str) -> bool {
-        self.conn()
+        self.read()
             .query_row(
                 "SELECT 1 FROM session WHERE token_hash=?1 AND expires_at > ?2",
                 params![token_hash, Utc::now().timestamp()],
@@ -1462,7 +1588,7 @@ impl Db {
     /// Live sessions, newest first. Expired rows are filtered here rather than
     /// left to `expire_sessions`, which sweeps only once an hour.
     pub fn sessions(&self) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT token_hash, expires_at FROM session WHERE expires_at > ?1 ORDER BY expires_at DESC",
         )?;
@@ -1563,6 +1689,8 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         notify: n("notify") != 0,
         down_since: n("down_since"),
         token: s("token"),
+        tag: s("tag"),
+        node_group: s("node_group"),
     }
 }
 
@@ -1757,7 +1885,7 @@ mod tests {
         db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 9 * 86_400);
 
-        db.set("retention_days", "9999").unwrap();
+        db.set("retention_metrics_days", "9999").unwrap();
         assert_eq!(db.stats().unwrap()["retention"], 3_650, "a stored window is still clamped");
     }
 
@@ -1779,7 +1907,7 @@ mod tests {
         }
         let _ = db.conn().query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         let fat = on_disk(&scratch.0);
-        db.prune(0).unwrap();
+        db.prune(0, 0).unwrap();
 
         let freed = db.vacuum().unwrap();
         assert!(freed > 0, "a vacuum after deleting 20 000 rows has to return space");
@@ -2182,7 +2310,7 @@ mod tests {
         db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
 
-        db.prune(30).unwrap();
+        db.prune(30, 30).unwrap();
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 1);
         assert_eq!(db.all_traffic()[&id].total_rx, 800);
     }

@@ -212,7 +212,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(trust_cf_ip(&app), &headers, peer.ip());
     if app.throttle.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     }
@@ -278,20 +278,14 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
     )
 }
 
-/// Begins binding: a fresh secret, returned with the otpauth:// URL a phone
-/// turns into a QR code. Nothing is stored yet -- the binding completes only
-/// once a code derived from this secret is confirmed, so an abandoned dialog
-/// leaves the sign-in path exactly as it was.
-pub async fn totp_begin(_: crate::api::Admin, State(app): State<crate::Shared>) -> Response {
+/// Begins binding: a fresh secret the operator pastes into an authenticator
+/// app by hand. No otpauth:// URL is derived from it: the panel shows the bare
+/// secret only, so there is no issuer or label to get wrong. Nothing is stored
+/// yet -- the binding completes only once a code derived from this secret is
+/// confirmed, so an abandoned dialog leaves the sign-in path exactly as it was.
+pub async fn totp_begin(_: crate::api::Admin, State(_): State<crate::Shared>) -> Response {
     let secret = BASE32_NOPAD.encode(&rand::random::<[u8; 20]>());
-    let issuer = app.db.get("site_name").unwrap_or_else(|| "Monitor".into());
-    let label = format!("{issuer}:admin");
-    let url = format!(
-        "otpauth://totp/{}?secret={secret}&issuer={}",
-        urlencode(&label),
-        &secret
-    );
-    Json(serde_json::json!({"secret": secret, "url": url})).into_response()
+    Json(serde_json::json!({"secret": secret})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -344,18 +338,6 @@ pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [Strin
     response
 }
 
-/// Percent-encodes everything outside the unreserved set, sufficient for
-/// placing a label inside the otpauth: URL.
-fn urlencode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
 /// through a local reverse proxy. Used for throttling and for the address shown
 /// beside a node, never for authorization.
@@ -379,10 +361,26 @@ fn urlencode(value: &str) -> String {
 /// Both addresses are canonicalized: the default dual-stack `[::]` listener
 /// reports IPv4 peers, 127.0.0.1 included, as `::ffff:a.b.c.d`, which no IPv6
 /// range below recognizes as local.
-pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+///
+/// A Cloudflare orange cloud is that second proxy. With the panel's
+/// `cf_connecting_ip` setting on, the address the edge writes --
+/// `CF-Connecting-IP`, overwritten on every pass through it -- is read before
+/// this header: behind an untrusting proxy the tail here is Cloudflare's own
+/// address, different on every connection, and the setting is what keeps a
+/// node's country badge from churning with it.
+pub fn client_ip(trust_cf: bool, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     let peer = peer.to_canonical();
     if !behind_local_proxy(peer) {
         return peer;
+    }
+    if trust_cf {
+        if let Some(ip) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            return ip.to_canonical();
+        }
     }
     headers
         .get("x-forwarded-for")
@@ -390,6 +388,13 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
         .and_then(|v| v.rsplit(',').next())
         .and_then(|v| v.trim().parse::<IpAddr>().ok())
         .map_or(peer, |ip| ip.to_canonical())
+}
+
+/// Whether the deployment says a Cloudflare edge sits in front of the local
+/// proxy. Read per request rather than cached: the setting is flipped from the
+/// panel, and a cached answer would keep the old addresses one restart long.
+pub fn trust_cf_ip(app: &App) -> bool {
+    app.db.get("cf_connecting_ip").as_deref() == Some("on")
 }
 
 /// Loopback or a private network, where a reverse proxy resides.
@@ -535,7 +540,7 @@ mod tests {
 
         // Nothing arrived with the request: the proxy appended the single
         // address it observed, which is the entire header.
-        assert_eq!(client_ip(&xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(false, &xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
 
         // The caller supplied a header of its own. Both documented proxies
         // append, so the fabricated value sits at the head and the proxy's
@@ -543,19 +548,65 @@ mod tests {
         // own throttle bucket each request, or claim the operator's address.
         let forged = xff("10.0.0.2, 198.51.100.9");
         for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
-            assert_eq!(client_ip(&forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
+            assert_eq!(client_ip(false, &forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
         }
 
         // A dual-stack `[::]` listener reports an IPv4 proxy as `::ffff:a.b.c.d`,
         // which is the same local peer.
-        assert_eq!(client_ip(&forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(&HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(false, &forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(false, &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
 
         // Directly from the internet the entire header is caller-supplied, and
         // honouring any part of it bypasses the lockout.
-        assert_eq!(client_ip(&forged, ip("203.0.113.5")), ip("203.0.113.5"));
-        assert_eq!(client_ip(&forged, ip("2001:db8::5")), ip("2001:db8::5"));
+        assert_eq!(client_ip(false, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(false, &forged, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer address is used.
-        assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+        assert_eq!(client_ip(false, &HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn the_cloudflare_header_is_read_only_when_the_setting_says_so() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let headers = |cf: Option<&str>, xff: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(v) = cf {
+                h.insert("cf-connecting-ip", v.parse().unwrap());
+            }
+            if let Some(v) = xff {
+                h.insert("x-forwarded-for", v.parse().unwrap());
+            }
+            h
+        };
+
+        // Off, the default: the edge's answer is ignored and the proxy's own
+        // observation -- Cloudflare's address, not the caller's -- is what the
+        // X-Forwarded-For tail holds.
+        let behind_edge = headers(Some("198.51.100.9"), Some("162.158.0.1"));
+        assert_eq!(client_ip(false, &behind_edge, ip("127.0.0.1")).to_string(), "162.158.0.1");
+
+        // On, the edge's answer wins: through Cloudflare the header was
+        // overwritten by the edge itself, so it is the one value a caller
+        // cannot choose.
+        assert_eq!(client_ip(true, &behind_edge, ip("127.0.0.1")).to_string(), "198.51.100.9");
+
+        // On but absent -- a deployment where Cloudflare fronts only some
+        // hosts, or was switched off since: the X-Forwarded-For fallback
+        // still applies.
+        assert_eq!(
+            client_ip(true, &headers(None, Some("198.51.100.9")), ip("127.0.0.1")).to_string(),
+            "198.51.100.9"
+        );
+
+        // On and unparseable: same fallback.
+        assert_eq!(
+            client_ip(true, &headers(Some("not-an-address"), Some("198.51.100.9")), ip("127.0.0.1"))
+                .to_string(),
+            "198.51.100.9"
+        );
+
+        // Directly from the internet the header is caller-supplied even with
+        // the setting on: the peer address is the only honest answer.
+        let forged = headers(Some("10.0.0.2"), Some("10.0.0.2, 198.51.100.9"));
+        assert_eq!(client_ip(true, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
     }
 }

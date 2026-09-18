@@ -79,6 +79,9 @@ CREATE TABLE IF NOT EXISTS node (
   last_seen INTEGER NOT NULL DEFAULT 0,
   -- Opt-in, as the operator decides which machines are worth an alert.
   notify INTEGER NOT NULL DEFAULT 0,
+  -- Renewal is per machine like the alert it can trigger: only a node opted in
+  -- here has its expiry date rolled forward while it keeps reporting.
+  auto_renew INTEGER NOT NULL DEFAULT 0,
   -- `last_seen` as of the offline alert, zero while none is outstanding. Stored
   -- rather than held in memory so that a hub restart neither repeats the alert
   -- nor loses the recovery that pairs with it.
@@ -149,7 +152,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -256,6 +259,10 @@ fn migrate_to_5(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "node_group TEXT NOT NULL DEFAULT ''")
 }
 
+fn migrate_to_6(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "auto_renew INTEGER NOT NULL DEFAULT 0")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -277,6 +284,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 5 {
         migrate_to_5(conn)?;
+    }
+    if from < 6 {
+        migrate_to_6(conn)?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
@@ -355,6 +365,12 @@ pub struct Node {
     /// Whether going offline and coming back are announced. See `notify`.
     #[serde(default)]
     pub notify: bool,
+    /// Whether an expiry date past due rolls forward whole billing cycles while
+    /// the node keeps reporting. Off by default: renewal is the operator's call
+    /// per machine, since a node that outlived its plan is as likely to deserve
+    /// a new expiry date entered by hand.
+    #[serde(default)]
+    pub auto_renew: bool,
     #[serde(default)]
     pub down_since: i64,
     /// What the agent authenticates with. Readable so the panel can display an
@@ -390,6 +406,7 @@ pub struct NodePatch {
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
     pub notify: Option<bool>,
+    pub auto_renew: Option<bool>,
     pub tag: Option<String>,
     #[serde(default, rename = "group")]
     pub node_group: Option<String>,
@@ -622,8 +639,8 @@ impl Db {
             // tie with whatever the last reorder placed first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day,
-                               tag, node_group, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                               tag, node_group, notify, auto_renew, created_at)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 n.name,
                 token,
@@ -638,6 +655,8 @@ impl Db {
                 n.traffic_reset_day,
                 n.tag,
                 n.node_group,
+                n.notify,
+                n.auto_renew,
                 Utc::now().timestamp()
             ],
         )?;
@@ -671,7 +690,8 @@ impl Db {
                              traffic_mode=COALESCE(?12,traffic_mode),
                              traffic_reset_day=COALESCE(?13,traffic_reset_day),
                              notify=COALESCE(?14,notify), tag=COALESCE(?15,tag),
-                             node_group=COALESCE(?16,node_group)
+                             node_group=COALESCE(?16,node_group),
+                             auto_renew=COALESCE(?17,auto_renew)
              WHERE id=?1",
             params![
                 id,
@@ -689,7 +709,8 @@ impl Db {
                 n.traffic_reset_day,
                 n.notify,
                 n.tag,
-                n.node_group
+                n.node_group,
+                n.auto_renew
             ],
         )?;
         Ok(found > 0)
@@ -1687,6 +1708,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         country: s("country"),
         last_seen: n("last_seen"),
         notify: n("notify") != 0,
+        auto_renew: n("auto_renew") != 0,
         down_since: n("down_since"),
         token: s("token"),
         tag: s("tag"),

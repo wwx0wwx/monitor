@@ -14,7 +14,8 @@ use tracing::debug;
 
 use crate::agent_ws::Agent;
 use crate::auth::{
-    authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
+    authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, trust_cf_ip,
+    with_cookies,
 };
 use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
@@ -155,6 +156,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
         view["notify"] = json!(node.notify);
+        view["auto_renew"] = json!(node.auto_renew);
     }
     view
 }
@@ -609,7 +611,7 @@ pub async fn agent_register(
     if !provisioning_allowed(&app, &headers) {
         return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
     }
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(trust_cf_ip(&app), &headers, peer.ip());
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
@@ -878,6 +880,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "auto_join_ping",
     "geoip_provider",
     "geoip_account_id",
+    "cf_connecting_ip",
     "retention_metrics_days",
     "retention_ping_days",
     "theme",
@@ -1417,6 +1420,7 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     out.insert("retention_metrics_days".into(), json!(app.db.retention_metrics_days().to_string()));
     out.insert("retention_ping_days".into(), json!(app.db.retention_ping_days().to_string()));
     out.insert("auto_join_ping".into(), json!(if app.db.get("auto_join_ping").as_deref() == Some("on") { "on" } else { "off" }));
+    out.insert("cf_connecting_ip".into(), json!(if crate::auth::trust_cf_ip(&app) { "on" } else { "off" }));
     out.insert(
         "geoip_provider".into(),
         json!(crate::geo::provider(&app).to_string()),
@@ -1471,6 +1475,9 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "auto_join_ping" if !matches!(value, "on" | "off") => {
             Some("auto join must be on or off".into())
+        }
+        "cf_connecting_ip" if !matches!(value, "on" | "off") => {
+            Some("cf_connecting_ip must be on or off".into())
         }
         "geoip_provider" if !matches!(value, "ipinfo" | "maxmind" | "dbip") => {
             Some("geoip provider must be ipinfo, maxmind or dbip".into())

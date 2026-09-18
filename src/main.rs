@@ -593,7 +593,9 @@ fn renew_online_nodes(app: &App) -> Result<()> {
     let nodes = app.db.nodes()?;
     let mut rolled = Vec::new();
     for node in &nodes {
-        if !online.contains(&node.id) {
+        // Opt-in per node: a machine still reporting past its plan is as likely
+        // to deserve a hand-entered date as an automatic roll.
+        if !node.auto_renew || !online.contains(&node.id) {
             continue;
         }
         let Some(expires) = node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()) else {

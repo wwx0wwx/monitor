@@ -63,6 +63,9 @@ export type Node = {
   token?: string
   /** Panel only. Whether going offline and returning are announced. */
   notify?: boolean
+  /** Panel only. Whether an expiry date past due rolls forward whole billing
+   *  cycles while the node keeps reporting. Off by default. */
+  auto_renew?: boolean
   /** Semicolon-separated badges, shown on the public card. */
   tag: string
   /** Filter dimension for the panel and the public page; empty means none. */

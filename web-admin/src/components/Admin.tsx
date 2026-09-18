@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import QRCode from "qrcode"
 import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
@@ -305,6 +304,7 @@ function BillingForm({ node, onClose, onSaved }: {
           currency: form.currency,
           billing_cycle: form.billing_cycle,
           expires_at: form.expires_at || null,
+          auto_renew: form.auto_renew,
         })),
       })
       toast.success("续费设置已保存")
@@ -361,6 +361,17 @@ function BillingForm({ node, onClose, onSaved }: {
               <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
             </Field>
           </div>
+          {/* Renewal is per node and off by default: a machine still up past its
+              plan may deserve a hand-entered date rather than a silent roll. */}
+          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+            <span>
+              <span className="block font-medium">到期自动续期</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">
+                过期后服务器仍在线时，到期日按付款周期整周期顺延，并推送提醒
+              </span>
+            </span>
+            <Switch checked={form.auto_renew} onCheckedChange={(v) => set("auto_renew", v)} />
+          </label>
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>取消</Button>
@@ -1385,6 +1396,16 @@ function SettingsTab() {
           />
           <span id="auto-ping-label">新添加的服务器自动加入全部延迟检测任务</span>
         </div>
+        <div className="flex items-center gap-2 text-sm">
+          <Switch
+            aria-labelledby="cf-ip-label"
+            checked={s.cf_connecting_ip === "on"}
+            onCheckedChange={(v) => set("cf_connecting_ip", v ? "on" : "off")}
+          />
+          <span id="cf-ip-label">
+            域名经 Cloudflare 橙云代理时，按 CF-Connecting-IP 识别服务器真实 IP
+          </span>
+        </div>
         <div>
           <Button
             size="sm"
@@ -1395,6 +1416,7 @@ function SettingsTab() {
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
                 auto_join_ping: s.auto_join_ping === "on" ? "on" : "off",
+                cf_connecting_ip: s.cf_connecting_ip === "on" ? "on" : "off",
               })
             }
           >
@@ -1802,10 +1824,10 @@ function Security() {
   const { s, set, save } = useSettings()
   const [password, setPassword] = useState("")
   const [recovery, setRecovery] = useState("")
-  // The TOTP binding flow: begin returns a secret and an otpauth URL, which
-  // becomes a QR to scan; confirm proves the authenticator holds the same
-  // secret with one live code. Neither step is stored until confirm succeeds.
-  const [binding, setBinding] = useState<{ secret: string; url: string; qr: string } | null>(null)
+  // The TOTP binding flow: begin returns a secret the operator pastes into an
+  // authenticator app; confirm proves the app holds the same secret with one
+  // live code. Neither step is stored until confirm succeeds.
+  const [binding, setBinding] = useState<{ secret: string } | null>(null)
   const [code, setCode] = useState("")
   const [busy, setBusy] = useState(false)
   const [confirmOff, setConfirmOff] = useState(false)
@@ -1814,9 +1836,8 @@ function Security() {
   async function beginTotp() {
     setBusy(true)
     try {
-      const r = await api<{ secret: string; url: string }>("/auth/totp")
-      const qr = await QRCode.toDataURL(r.url, { margin: 1, width: 192 })
-      setBinding({ ...r, qr })
+      const r = await api<{ secret: string }>("/auth/totp")
+      setBinding(r)
       setCode("")
     } catch (e) {
       toast.error((e as Error).message)
@@ -1877,37 +1898,39 @@ function Security() {
           </p>
         )}
         {binding ? (
-          <div className="grid gap-4 sm:grid-cols-[auto_1fr]">
-            {/* The otpauth URL as a QR: typing a 32-character secret by hand
-                is how binding fails on a phone. */}
-            <img src={binding.qr} alt="验证器二维码" className="size-48 rounded-md border" />
-            <div className="space-y-4">
-              <Field label="验证器密钥" hint="扫不了码时手动输入这串密钥">
-                <div className="flex gap-2">
-                  <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs select-all">
-                    {binding.secret}
-                  </code>
-                  <Button size="sm" variant="outline" onClick={() => copy(binding.secret)}>
-                    <Copy className="size-4" />
-                  </Button>
-                </div>
-              </Field>
-              <Field label="输入 App 显示的 6 位验证码完成绑定">
-                <div className="flex gap-2">
-                  <Input
-                    inputMode="numeric"
-                    placeholder="000000"
-                    value={code}
-                    onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                    className="w-28 font-mono"
-                  />
-                  <Button size="sm" disabled={busy || code.length !== 6} onClick={confirmTotp}>
-                    确认开启
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={() => setBinding(null)}>取消</Button>
-                </div>
-              </Field>
-            </div>
+          <div className="space-y-4">
+            {/* Secret text only: one input field in the app beats a camera
+                lens aimed at a screen, and with no derived otpauth URL there
+                is nothing on the card that can go stale or get the issuer
+                wrong. */}
+            <Field
+              label="验证器密钥"
+              hint="在验证器 App 里选「手动输入密钥」，粘贴这串字符"
+            >
+              <div className="flex gap-2">
+                <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs select-all">
+                  {binding.secret}
+                </code>
+                <Button size="sm" variant="outline" onClick={() => copy(binding.secret)}>
+                  <Copy className="size-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label="输入 App 显示的 6 位验证码完成绑定">
+              <div className="flex gap-2">
+                <Input
+                  inputMode="numeric"
+                  placeholder="000000"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  className="w-28 font-mono"
+                />
+                <Button size="sm" disabled={busy || code.length !== 6} onClick={confirmTotp}>
+                  确认开启
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setBinding(null)}>取消</Button>
+              </div>
+            </Field>
           </div>
         ) : (
           <div className="flex flex-wrap gap-2">

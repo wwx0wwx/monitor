@@ -584,7 +584,7 @@ fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDat
     (next != expires).then_some(next)
 }
 
-fn renew_online_nodes(app: &App) -> Result<()> {
+pub(crate) fn renew_online_nodes(app: &App) -> Result<()> {
     // The hub's local timezone, as with the traffic boundaries: an expiry date
     // is one a person entered, and on a UTC+8 hub `Utc` reports the previous day
     // until 08:00 while the panel already shows it expired.

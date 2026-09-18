@@ -705,6 +705,15 @@ pub async fn update_node(
     }
     match app.db.update_node(id, &node) {
         Ok(true) => {
+            // A renewal switched on for a machine already up past its plan
+            // should not wait for the hourly pass: the toggle save is the
+            // moment the operator asked for it. The pass itself re-checks the
+            // gate, so it is a no-op when the toggle was switched off.
+            if node.auto_renew.is_some() {
+                if let Err(e) = crate::renew_online_nodes(&app) {
+                    tracing::warn!("rolling expiry dates failed: {e:#}");
+                }
+            }
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }

@@ -1419,16 +1419,13 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     // here as well.
     out.insert("retention_metrics_days".into(), json!(app.db.retention_metrics_days().to_string()));
     out.insert("retention_ping_days".into(), json!(app.db.retention_ping_days().to_string()));
-    out.insert("auto_join_ping".into(), json!(if app.db.get("auto_join_ping").as_deref() == Some("on") { "on" } else { "off" }));
+    out.insert(
+        "auto_join_ping".into(),
+        json!(if app.db.get("auto_join_ping").as_deref() == Some("on") { "on" } else { "off" }),
+    );
     out.insert("cf_connecting_ip".into(), json!(if crate::auth::trust_cf_ip(&app) { "on" } else { "off" }));
-    out.insert(
-        "geoip_provider".into(),
-        json!(crate::geo::provider(&app).to_string()),
-    );
-    out.insert(
-        "totp_set".into(),
-        json!(crate::auth::totp_bound(&app)),
-    );
+    out.insert("geoip_provider".into(), json!(crate::geo::provider(&app).to_string()));
+    out.insert("totp_set".into(), json!(crate::auth::totp_bound(&app)));
     out.insert(
         "emergency_password_set".into(),
         json!(app.db.get("emergency_password_hash").is_some_and(|v| !v.is_empty())),
@@ -2477,7 +2474,8 @@ mod tests {
         let save = |body: Value| save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(body));
 
         // BTreeMap order places the password first, which is the failing case.
-        let refused = save(json!({"admin_password": "a-long-enough-one", "retention_metrics_days": "abc"})).await;
+        let refused =
+            save(json!({"admin_password": "a-long-enough-one", "retention_metrics_days": "abc"})).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(app.db.get("admin_password_hash").as_deref(), Some("the-old-hash"));
 
@@ -2668,8 +2666,7 @@ mod tests {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
         assert_eq!(
-            read["retention_metrics_days"],
-            "7",
+            read["retention_metrics_days"], "7",
             "the default belongs in the answer, not in each caller"
         );
         assert_eq!(read["retention_ping_days"], "7");
@@ -2695,11 +2692,7 @@ mod tests {
             StatusCode::OK,
             "a fresh hub's own settings must survive a round trip"
         );
-        assert_eq!(
-            app.db.retention_metrics_days(),
-            7,
-            "and the stored window is the one that was shown"
-        );
+        assert_eq!(app.db.retention_metrics_days(), 7, "and the stored window is the one that was shown");
         assert_eq!(app.db.retention_ping_days(), 7);
     }
 

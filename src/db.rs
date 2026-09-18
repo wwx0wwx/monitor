@@ -1401,8 +1401,7 @@ impl Db {
     pub fn stats(&self) -> Result<serde_json::Value> {
         // Before acquiring the connection: a guard on a plain Mutex must not be
         // taken twice by one thread, and the retention reads take one too.
-        let (retention_metrics, retention_ping) =
-            (self.retention_metrics_days(), self.retention_ping_days());
+        let (retention_metrics, retention_ping) = (self.retention_metrics_days(), self.retention_ping_days());
         let conn = self.read();
         let file = main_file(&conn);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;

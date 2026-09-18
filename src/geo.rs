@@ -42,7 +42,8 @@ fn mmdb_path(app: &App) -> PathBuf {
 /// The cached reader, opened at most once per file. `Arc` rather than a bare
 /// `Reader` because the lookup path hands clones out under the lock instead of
 /// holding it for the duration of a query.
-static READER: OnceLock<Mutex<Option<Arc<Reader<Vec<u8>>>>>> = OnceLock::new();
+type Cached = Option<Arc<Reader<Vec<u8>>>>;
+static READER: OnceLock<Mutex<Cached>> = OnceLock::new();
 
 /// Drops the cached reader, so the next lookup opens the file on disk again.
 /// Called after a manual update; a restart does the same.

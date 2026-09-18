@@ -12,7 +12,7 @@
 | 仓库 | 说明 |
 |---|---|
 | [monitor](https://github.com/monitor-probe/monitor) | hub：后台、API、公开页宿主 |
-| [agent](https://github.com/monitor-probe/agent) | Linux agent |
+| [agent](https://github.com/wwx0wwx/agent) | Linux agent（fork：版本代号制，pio → voy → cas → new） |
 | [monitor-theme-default](https://github.com/monitor-probe/monitor-theme-default) | 内置默认主题 |
 
 ```

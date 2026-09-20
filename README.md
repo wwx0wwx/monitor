@@ -1,3 +1,5 @@
+> [!WARNING]
+> 本仓库已并入 [wwx0wwx/one-monitor](https://github.com/wwx0wwx/one-monitor)（hub 在 [`hub/`](https://github.com/wwx0wwx/one-monitor/tree/main/hub)），此处不再维护，仅保留历史与既有 release。
 # monitor
 
 ## 特性

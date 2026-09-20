@@ -14,7 +14,7 @@ set -eu
 # Debian does not set it.
 PATH="$PATH:/usr/sbin:/sbin"
 
-REPO="wwx0wwx/monitor"
+REPO="wwx0wwx/one-monitor"
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,
@@ -112,7 +112,9 @@ install_hub() {
 	*) die "不支持的架构：$(uname -m)（发布的是 x86_64 与 aarch64）" ;;
 	esac
 	asset="monitor-hub-$arch-unknown-linux-musl"
-	base="https://github.com/$REPO/releases/latest/download"
+	# 本仓库已并入 one-monitor，那里的 releases/latest 可能是 agent 或主题的
+	# release，这里钉死当前 hub 版本；新脚本见 one-monitor 仓库 hub/ 目录。
+	base="https://github.com/$REPO/releases/download/v1.3.0"
 	ok "架构" "$arch"
 
 	# Whatever the command line did not specify is recovered from the old unit;
